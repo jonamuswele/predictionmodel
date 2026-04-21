@@ -4,10 +4,8 @@ from __future__ import annotations
 import io
 import json
 import shutil
-import sys
 import tempfile
 import traceback
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,168 +14,134 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-# Import the full pipeline from the existing module. We do NOT modify it.
 import flood_forecast_nigeria as ffn
-
 
 # ---------------------------------------------------------------------------
 # Page configuration
 # ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="Nigeria Flood Forecast",
-    page_icon="[water]",
+    page_icon="🌊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 CSS = """
 <style>
-    .main > div { padding-top: 1rem; }
-    .alert-red    { background:#fadbd8; padding:8px 14px; border-radius:6px;
-                     border-left:6px solid #C0392B; margin-bottom:6px; }
-    .alert-amber  { background:#fdebd0; padding:8px 14px; border-radius:6px;
-                     border-left:6px solid #F39C12; margin-bottom:6px; }
-    .alert-green  { background:#d5f5e3; padding:8px 14px; border-radius:6px;
-                     border-left:6px solid #27AE60; margin-bottom:6px; }
-    .metric-card  { background:#F8F9F9; padding:14px 16px; border-radius:8px;
-                     box-shadow:0 1px 3px rgba(0,0,0,0.08); }
+    .main > div { padding-top: 0.6rem; }
+    .alert-red   { background:#fadbd8; padding:8px 14px; border-radius:6px;
+                   border-left:6px solid #C0392B; margin-bottom:6px; }
+    .alert-amber { background:#fdebd0; padding:8px 14px; border-radius:6px;
+                   border-left:6px solid #F39C12; margin-bottom:6px; }
+    .alert-green { background:#d5f5e3; padding:8px 14px; border-radius:6px;
+                   border-left:6px solid #27AE60; margin-bottom:6px; }
     .stButton button { width: 100%; }
+    .nav-title   { font-size: 1.05rem; font-weight: 600; margin-bottom: 4px; }
+    .small-note  { color:#566573; font-size: 0.85rem; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
 
 # ===========================================================================
-#                         WebApp orchestration class
+#                         Web-only helpers (no ffn changes)
+# ===========================================================================
+def _try_import_folium():
+    try:
+        import folium
+        from folium import plugins  # noqa: F401
+        return folium
+    except Exception:
+        return None
+
+
+def _try_import_rasterio_features():
+    try:
+        from rasterio import features as rio_features
+        from rasterio.transform import Affine  # noqa: F401
+        return rio_features
+    except Exception:
+        return None
+
+
+# ===========================================================================
+#                          FloodForecastWebApp
 # ===========================================================================
 class FloodForecastWebApp:
     """Self-contained Streamlit front-end for FloodForecastSystem."""
 
-    ALERT_COLORS = {"RED": "#C0392B", "AMBER": "#F39C12", "GREEN": "#27AE60"}
+    PAGES = ["🗺️  Map", "📤 Upload Data", "📊 Forecast & Alerts",
+             "📈 Raw Data", "📚 Instructions", "ℹ️  About"]
+
+    ALERT_HEX = {"RED": "#C0392B", "AMBER": "#F39C12", "GREEN": "#27AE60"}
 
     # ------------------------------------------------------------------
     def __init__(self) -> None:
-        """Initialise session state keys used across reruns."""
         defaults: Dict[str, Any] = {
-            "pipeline_ready": False,
+            "page": self.PAGES[0],
             "system": None,
-            "workdir": None,
-            "gauge_path": None,
-            "dem_path": None,
-            "met_path": None,
             "forecast_report": None,
             "forecast_date": None,
-            "forecast_df": None,
-            "last_error": None,
+            "workdir": None,
             "run_log": [],
+            "last_error": None,
+            "is_demo": True,
+            "horizon_days": 14,
+            "forecast_start": None,
         }
         for k, v in defaults.items():
             if k not in st.session_state:
                 st.session_state[k] = v
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Filesystem
     # ------------------------------------------------------------------
     def _workdir(self) -> Path:
-        """Return (and lazily create) a per-session working directory."""
         if st.session_state.workdir is None:
             tmp = Path(tempfile.mkdtemp(prefix="flood_web_"))
-            (tmp / "data" / "gauges").mkdir(parents=True, exist_ok=True)
-            (tmp / "data" / "dem").mkdir(parents=True, exist_ok=True)
-            (tmp / "data" / "met").mkdir(parents=True, exist_ok=True)
-            (tmp / "data" / "chirps").mkdir(parents=True, exist_ok=True)
-            (tmp / "outputs").mkdir(parents=True, exist_ok=True)
+            for sub in ("data/gauges", "data/dem", "data/met",
+                        "data/chirps", "outputs"):
+                (tmp / sub).mkdir(parents=True, exist_ok=True)
             st.session_state.workdir = str(tmp)
         return Path(st.session_state.workdir)
 
-    def _save_to_r2(self, system) -> None:
-        """Save results to R2 if cloud storage is configured"""
-        if not system.config.use_cloud_storage:
-            return
-        
-        try:
-            from cloud_storage import R2Storage
-            
-            storage = R2Storage(
-                endpoint_url=system.config.r2_endpoint_url,
-                access_key=system.config.r2_access_key,
-                secret_key=system.config.r2_secret_key,
-                bucket_name=system.config.r2_bucket_name
-            )
-            
-            session_id = st.session_state.get("session_id", "latest")
-            output_dir = Path(system.config.output_dir)
-            
-            # Upload flood map
-            map_file = output_dir / f"flood_map_{st.session_state.forecast_date}.html"
-            if map_file.exists():
-                url = storage.upload_file(map_file, f"{session_id}/flood_map.html")
-                st.success(f"✅ Map saved to cloud: {url}")
-            
-            # Upload alert report
-            alert_file = output_dir / f"alert_report_{st.session_state.forecast_date}.json"
-            if alert_file.exists():
-                storage.upload_file(alert_file, f"{session_id}/alert_report.json")
-                st.success(f"✅ Alert report saved to cloud")
-            
-            # Upload all station forecast plots
-            for png in output_dir.glob("*_forecast.png"):
-                storage.upload_file(png, f"{session_id}/plots/{png.name}")
-            
-            # Upload routed discharge CSVs
-            for sid, df in system.routed_Q.items():
-                csv_path = output_dir / f"{sid}_routed.csv"
-                df.to_csv(csv_path)
-                storage.upload_file(csv_path, f"{session_id}/data/{sid}_routed.csv")
-                
-        except Exception as e:
-            st.warning(f"Cloud save failed: {e}")
-
-    # ------------------------------------------------------------------
     def _reset_workdir(self) -> None:
-        """Clear any cached pipeline state and remove the workdir tree."""
         if st.session_state.workdir and Path(st.session_state.workdir).exists():
             try:
                 shutil.rmtree(st.session_state.workdir)
             except Exception:
                 pass
-        st.session_state.workdir = None
-        st.session_state.pipeline_ready = False
-        st.session_state.system = None
-        st.session_state.gauge_path = None
-        st.session_state.dem_path = None
-        st.session_state.met_path = None
-        st.session_state.forecast_report = None
-        st.session_state.forecast_df = None
-        st.session_state.last_error = None
+        for k in ("workdir", "system", "forecast_report", "forecast_date",
+                  "last_error"):
+            st.session_state[k] = None
         st.session_state.run_log = []
+        st.session_state.is_demo = True
 
-    # ------------------------------------------------------------------
     def _log(self, msg: str) -> None:
-        """Append a user-visible log line for the next rerun."""
         st.session_state.run_log.append(msg)
 
     # ------------------------------------------------------------------
+    # Templates
+    # ------------------------------------------------------------------
     @staticmethod
     def _template_gauge_csv() -> bytes:
-        """Return an example gauge-station CSV (bytes) for the user to download."""
         idx = pd.date_range("2023-01-01", "2024-12-31", freq="D")
         rng = np.random.default_rng(0)
         doy = np.array([d.timetuple().tm_yday for d in idx])
-        rows = []
-        sample_stations = [
+        stations = [
             ("NIG_LOK", "Lokoja", 7.80, 6.74, "Niger", 6000.0),
             ("BEN_MAK", "Makurdi", 7.73, 8.54, "Benue", 2500.0),
             ("OSU_OSO", "Oshogbo", 7.76, 4.56, "Osun", 120.0),
         ]
         seasonal = 1.0 + 1.3 * np.sin(2 * np.pi * (doy - 150) / 365.25)
-        for sid, name, lat, lon, river, mean_q in sample_stations:
-            q = np.clip(mean_q * seasonal * rng.normal(1.0, 0.25, len(idx)), 1.0, None)
-            stage = 1.0 + np.log1p(q / mean_q) * 1.5
-            for d, Q, H in zip(idx, q, stage):
+        rows = []
+        for sid, nm, lat, lon, riv, meanq in stations:
+            q = np.clip(meanq * seasonal * rng.normal(1.0, 0.25, len(idx)), 1.0, None)
+            h = 1.0 + np.log1p(q / meanq) * 1.5
+            for d, Q, H in zip(idx, q, h):
                 rows.append({
-                    "station_id": sid, "station_name": name,
-                    "latitude": lat, "longitude": lon, "river": river,
+                    "station_id": sid, "station_name": nm,
+                    "latitude": lat, "longitude": lon, "river": riv,
                     "date": d.strftime("%Y-%m-%d"),
                     "discharge_m3s": round(float(Q), 2),
                     "stage_m": round(float(H), 3),
@@ -186,145 +150,119 @@ class FloodForecastWebApp:
         pd.DataFrame(rows).to_csv(buf, index=False)
         return buf.getvalue().encode("utf-8")
 
-    # ------------------------------------------------------------------
     @staticmethod
     def _template_met_csv() -> bytes:
-        """Return an example merged meteorology CSV."""
         idx = pd.date_range("2023-01-01", "2024-12-31", freq="D")
         rng = np.random.default_rng(1)
         doy = np.array([d.timetuple().tm_yday for d in idx])
         wet = np.isin(np.array([d.month for d in idx]), [5, 6, 7, 8, 9, 10])
-        precip = np.where(wet,
-                           rng.gamma(0.8, 12.0, len(idx)),
-                           rng.gamma(0.3, 2.5, len(idx)))
+        precip = np.where(wet, rng.gamma(0.8, 12.0, len(idx)),
+                          rng.gamma(0.3, 2.5, len(idx)))
         temp = 27.0 + 5.0 * np.sin(2 * np.pi * (doy - 90) / 365.25) + rng.normal(0, 1, len(idx))
         pet = np.clip(rng.normal(4.5, 0.8, len(idx)), 0.2, None)
         df = pd.DataFrame({"date": idx.strftime("%Y-%m-%d"),
-                            "precip_mm": np.clip(precip, 0, None).round(2),
-                            "temp_c": temp.round(2),
-                            "pet_mm": pet.round(2)})
+                           "precip_mm": np.clip(precip, 0, None).round(2),
+                           "temp_c": temp.round(2),
+                           "pet_mm": pet.round(2)})
         buf = io.StringIO()
         df.to_csv(buf, index=False)
         return buf.getvalue().encode("utf-8")
 
-    # ------------------------------------------------------------------
     @staticmethod
-    def _template_nwp_csv(horizon_days: int, station_ids: Optional[List[str]] = None) -> bytes:
-        """Return an example NWP precipitation CSV for the given horizon."""
+    def _template_nwp_csv(horizon_days: int) -> bytes:
         idx = pd.date_range(pd.Timestamp.today().normalize() + pd.Timedelta(days=1),
-                             periods=horizon_days, freq="D")
+                            periods=horizon_days, freq="D")
         rng = np.random.default_rng(2)
         p = np.clip(rng.gamma(1.0, 10.0, horizon_days), 0, None)
-        if station_ids:
-            data = {sid: np.clip(p + rng.normal(0, 2, horizon_days), 0, None)
-                    for sid in station_ids}
-        else:
-            data = {"area_mean": p}
-        df = pd.DataFrame(data, index=idx)
+        df = pd.DataFrame({"area_mean": p}, index=idx)
         df.index.name = "date"
         buf = io.StringIO()
         df.to_csv(buf)
         return buf.getvalue().encode("utf-8")
 
     # ------------------------------------------------------------------
+    # File ingest
+    # ------------------------------------------------------------------
     def _save_uploaded_file(self, uploaded: Any, dest: Path) -> Path:
-        """Persist a Streamlit UploadedFile to disk and return the path."""
         dest.parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as fh:
             fh.write(uploaded.getvalue())
         return dest
 
-    # ------------------------------------------------------------------
     def _build_config(self, start_date: str, end_date: str,
-                       forecast_horizon_days: int) -> ffn.Config:
-        """Construct a Config whose paths live inside the per-session workdir."""
+                      horizon_days: int) -> ffn.Config:
         wd = self._workdir()
-        cfg = ffn.Config(
+        return ffn.Config(
             data_dir=wd / "data",
             dem_path=wd / "data" / "dem" / "dem.tif",
             gauge_csv=wd / "data" / "gauges" / "gauge_stations.csv",
             output_dir=wd / "outputs",
             start_date=start_date,
             end_date=end_date,
-            forecast_horizon_days=int(forecast_horizon_days),
+            forecast_horizon_days=int(horizon_days),
         )
-        return cfg
 
-    # ------------------------------------------------------------------
-    def _ensure_gauge_csv(self, uploaded_gauge: Any, cfg: ffn.Config) -> Path:
-        """Place the user-uploaded or synthetic gauge CSV at cfg.gauge_csv."""
-        if uploaded_gauge is not None:
-            path = self._save_uploaded_file(uploaded_gauge, Path(cfg.gauge_csv))
+    def _ensure_gauge_csv(self, uploaded: Any, cfg: ffn.Config) -> Path:
+        if uploaded is not None:
+            path = self._save_uploaded_file(uploaded, Path(cfg.gauge_csv))
             self._log(f"Saved uploaded gauge CSV ({path.stat().st_size/1024:.1f} KB).")
             return path
-        # Synthetic fallback via FloodForecastSystem helper (reused, not duplicated).
         system = ffn.FloodForecastSystem(cfg)
         system._write_synthetic_gauge_csv()
-        self._log("No gauge CSV uploaded - using synthetic 10-year demo record.")
+        self._log("No gauge CSV - using synthetic 10-year demo record.")
         return Path(cfg.gauge_csv)
 
-    # ------------------------------------------------------------------
-    def _ensure_dem(self, uploaded_dem: Any, cfg: ffn.Config) -> Path:
-        """Place the user-uploaded DEM GeoTIFF or build the synthetic one."""
-        if uploaded_dem is not None:
-            path = self._save_uploaded_file(uploaded_dem, Path(cfg.dem_path))
+    def _ensure_dem(self, uploaded: Any, cfg: ffn.Config) -> Path:
+        if uploaded is not None:
+            path = self._save_uploaded_file(uploaded, Path(cfg.dem_path))
             self._log(f"Saved uploaded DEM ({path.stat().st_size/1024/1024:.1f} MB).")
             return path
         delin = ffn.WatershedDelineator(cfg)
         delin.generate_synthetic_dem()
-        self._log("No DEM uploaded - generated synthetic Nigeria DEM.")
+        self._log("No DEM - generated synthetic Nigeria DEM.")
         return Path(cfg.dem_path)
 
-    # ------------------------------------------------------------------
-    def _ensure_met(self, uploaded_met: Any, cfg: ffn.Config) -> Optional[pd.DataFrame]:
-        """Return a merged met DataFrame from upload, or None to let the pipeline synthesise."""
-        if uploaded_met is None:
+    def _ensure_met(self, uploaded: Any) -> Optional[pd.DataFrame]:
+        if uploaded is None:
             return None
         try:
-            df = pd.read_csv(uploaded_met)
+            df = pd.read_csv(uploaded)
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date").sort_index()
             required = {"precip_mm", "temp_c", "pet_mm"}
             if not required.issubset(df.columns):
-                self._log(f"Met CSV missing columns {required - set(df.columns)} - ignoring.")
+                self._log(f"Met CSV missing {required - set(df.columns)} - ignoring.")
                 return None
-            self._log(f"Loaded user met CSV with {len(df):,} rows.")
+            self._log(f"Loaded user met CSV ({len(df):,} rows).")
             return df
         except Exception as exc:
             self._log(f"Could not parse met CSV: {exc}")
             return None
 
-    # ------------------------------------------------------------------
-    def _build_nwp(self, uploaded_nwp: Any, horizon_days: int, start: pd.Timestamp,
-                    station_ids: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Return (precip_df, pet_df) for the forecast horizon."""
+    def _build_nwp(self, uploaded: Any, horizon_days: int,
+                   start: pd.Timestamp) -> Tuple[pd.DataFrame, pd.DataFrame]:
         idx = pd.date_range(start, periods=horizon_days, freq="D")
-        if uploaded_nwp is not None:
+        if uploaded is not None:
             try:
-                df = pd.read_csv(uploaded_nwp)
+                df = pd.read_csv(uploaded)
                 date_col = next((c for c in df.columns if c.lower() == "date"), None)
                 if date_col is None:
                     raise ValueError("NWP CSV needs a 'date' column")
                 df[date_col] = pd.to_datetime(df[date_col])
                 df = df.set_index(date_col).sort_index()
                 df = df.reindex(idx).ffill().bfill()
-                # Accept either per-station columns or a single area_mean column.
                 precip_cols = [c for c in df.columns if c.lower() != "pet_mm"]
                 p_df = df[precip_cols]
-                # PET column optional; synthesise if missing.
                 if "pet_mm" in df.columns:
                     e_df = pd.DataFrame({"area_mean": df["pet_mm"]}, index=idx)
                 else:
-                    e_df = pd.DataFrame(
-                        {"area_mean": np.full(horizon_days, 4.5)}, index=idx)
+                    e_df = pd.DataFrame({"area_mean": np.full(horizon_days, 4.5)}, index=idx)
                 self._log(f"Loaded uploaded NWP CSV for {horizon_days} days.")
                 return p_df, e_df
             except Exception as exc:
-                self._log(f"NWP CSV parse failed ({exc}) - synthesising instead.")
-
+                self._log(f"NWP parse failed ({exc}) - synthesising instead.")
         rng = np.random.default_rng(11)
         precip = np.clip(rng.gamma(1.0, 10.0, horizon_days), 0.0, None)
-        # Inject a modest pulse so forecasts are visually non-trivial.
         if horizon_days >= 3:
             precip[2] += 35.0
             precip[min(3, horizon_days - 1)] += 20.0
@@ -335,290 +273,554 @@ class FloodForecastWebApp:
         return p_df, e_df
 
     # ------------------------------------------------------------------
-    # Pipeline runners
+    # Pipeline execution
     # ------------------------------------------------------------------
-    def run_historical(self, uploaded_gauge: Any, uploaded_dem: Any,
-                        uploaded_met: Any, start_date: str, end_date: str,
-                        horizon_days: int) -> Optional[ffn.FloodForecastSystem]:
-        """Execute hindcast through the full FloodForecastSystem pipeline."""
-        cfg = self._build_config(start_date, end_date, horizon_days)
-        if hasattr(st, 'secrets') and 'r2' in st.secrets:
-            cfg.use_cloud_storage = True
-            cfg.r2_endpoint_url = st.secrets["r2"]["endpoint_url"]
-            cfg.r2_access_key = st.secrets["r2"]["access_key_id"]
-            cfg.r2_secret_key = st.secrets["r2"]["secret_access_key"]
-            cfg.r2_bucket_name = st.secrets["r2"]["bucket_name"]
-        self._ensure_gauge_csv(uploaded_gauge, cfg)
-        self._ensure_dem(uploaded_dem, cfg)
-        user_met = self._ensure_met(uploaded_met, cfg)
+    def _patch_with_user_met(self, system: ffn.FloodForecastSystem,
+                             cfg: ffn.Config, user_met: pd.DataFrame) -> None:
+        """Instance-level monkey-patch: use the user met CSV verbatim."""
+        user_met_clipped = user_met.reindex(
+            pd.date_range(cfg.start_date, cfg.end_date, freq="D")
+        ).interpolate(limit=14).ffill().bfill()
 
-        system = ffn.FloodForecastSystem(cfg)
+        def _patched():
+            dm = ffn.DataManager(cfg)
+            dm.load_gauge_data()
+            setattr(cfg, "sparse_stations", list(dm.sparse_stations))
+            merged = user_met_clipped.copy()
+            for col in ("precip_mm", "temp_c", "pet_mm"):
+                if col not in merged.columns:
+                    merged[col] = 0.0
+            system.met_data = merged
+            system.data_manager = dm
+            gf = ffn.GapFiller(cfg, dm.gauge_data, merged)
+            gf.fill_all()
+            system.gap_filler = gf
+            wd = ffn.WatershedDelineator(cfg)
+            wd.load_dem()
+            watershed = wd.delineate()
+            watershed["dem"] = wd.dem
+            watershed["profile"] = wd.profile
+            watershed["basin_precip"] = wd.get_basin_mean_precip(
+                watershed["basins"], cfg.data_dir / "chirps")
+            system.watershed_data = watershed
+            system.delineator = wd
+            hm = ffn.HydrologicalModel(cfg, watershed["basins"],
+                                       dm.gauge_data, merged)
+            for sid in dm.gauge_data.keys():
+                hm.calibrate(sid)
+            for sid in dm.gauge_data.keys():
+                system.hindcasts[sid] = hm.run_hindcast(sid)
+                system.Q_per_basin[sid] = system.hindcasts[sid][["Q_sim_m3s"]].copy()
+                system.return_periods[sid] = hm.compute_return_periods(
+                    sid, system.hindcasts[sid]["Q_sim_m3s"])
+            system.hydro_model = hm
+            fr = ffn.FloodRouter(cfg, watershed, system.Q_per_basin)
+            system.routed_Q = fr.route_network()
+            system.flood_router = fr
+            peak = fr.get_peak_flood_map(cfg.end_date)
+            stations_gdf = dm.get_station_geodataframe()
+            ad = ffn.AlertDashboard(
+                cfg, system.routed_Q, system.return_periods,
+                peak, stations_gdf,
+                hindcasts=system.hindcasts, forecasts={},
+                river_network=watershed.get("river_network"))
+            ad.plot_all_stations()
+            ad.generate_folium_map(cfg.end_date)
+            ad.generate_alert_report(cfg.end_date)
+            system.alert_dashboard = ad
 
-        # If the user supplied met data, monkey-patch the DataManager loader
-        # for this run so the pipeline uses it verbatim. We do NOT modify the
-        # original class - just instance-level attribute assignment below.
-        if user_met is not None:
-            user_met_clipped = user_met.reindex(
-                pd.date_range(start_date, end_date, freq="D")
-            ).interpolate(limit=14).ffill().bfill()
+        _patched()
 
-            original_run_historical = system.run_historical
-
-            def _patched_run_historical():
-                dm = ffn.DataManager(cfg)
-                dm.load_gauge_data()
-                setattr(cfg, "sparse_stations", list(dm.sparse_stations))
-                merged = user_met_clipped.copy()
-                for col in ("precip_mm", "temp_c", "pet_mm"):
-                    if col not in merged.columns:
-                        merged[col] = 0.0
-                system.met_data = merged
-                system.data_manager = dm
-                gf = ffn.GapFiller(cfg, dm.gauge_data, merged)
-                gf.fill_all()
-                system.gap_filler = gf
-                wd = ffn.WatershedDelineator(cfg)
-                wd.load_dem()
-                watershed = wd.delineate()
-                watershed["dem"] = wd.dem
-                watershed["profile"] = wd.profile
-                watershed["basin_precip"] = wd.get_basin_mean_precip(
-                    watershed["basins"], cfg.data_dir / "chirps")
-                system.watershed_data = watershed
-                system.delineator = wd
-                hm = ffn.HydrologicalModel(cfg, watershed["basins"],
-                                             dm.gauge_data, merged)
-                for sid in dm.gauge_data.keys():
-                    hm.calibrate(sid)
-                for sid in dm.gauge_data.keys():
-                    system.hindcasts[sid] = hm.run_hindcast(sid)
-                    system.Q_per_basin[sid] = system.hindcasts[sid][["Q_sim_m3s"]].copy()
-                    system.return_periods[sid] = hm.compute_return_periods(
-                        sid, system.hindcasts[sid]["Q_sim_m3s"])
-                system.hydro_model = hm
-                fr = ffn.FloodRouter(cfg, watershed, system.Q_per_basin)
-                system.routed_Q = fr.route_network()
-                system.flood_router = fr
-                peak = fr.get_peak_flood_map(cfg.end_date)
-                stations_gdf = dm.get_station_geodataframe()
-                ad = ffn.AlertDashboard(
-                    cfg, system.routed_Q, system.return_periods,
-                    peak, stations_gdf,
-                    hindcasts=system.hindcasts, forecasts={},
-                    river_network=watershed.get("river_network"))
-                ad.plot_all_stations()
-                ad.generate_folium_map(cfg.end_date)
-                ad.generate_alert_report(cfg.end_date)
-                system.alert_dashboard = ad
-
-            try:
-                _patched_run_historical()
-            except Exception as exc:  # pragma: no cover
-                st.session_state.last_error = f"Hindcast failed: {exc}\n{traceback.format_exc()}"
-                return None
-        else:
-            try:
-                system.run_historical()
-            except Exception as exc:  # pragma: no cover
-                st.session_state.last_error = f"Hindcast failed: {exc}\n{traceback.format_exc()}"
-                return None
-
-        self._log("Hindcast complete - ready to forecast.")
-        return system
-
-    # ------------------------------------------------------------------
-    def run_forecast(self, system: ffn.FloodForecastSystem,
-                      uploaded_nwp: Any, forecast_start: pd.Timestamp,
-                      horizon_days: int) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Run the forecast stage; returns the alert report dict."""
-        # Override horizon for this run (Config is mutable).
-        system.config.forecast_horizon_days = int(horizon_days)
-        station_ids = list(system.Q_per_basin.keys())
-        p_df, e_df = self._build_nwp(uploaded_nwp, horizon_days, forecast_start, station_ids)
+    def run_pipeline(self, uploaded_gauge: Any, uploaded_dem: Any,
+                     uploaded_met: Any, uploaded_nwp: Any,
+                     start_date: str, end_date: str,
+                     forecast_start: pd.Timestamp, horizon_days: int,
+                     is_demo: bool) -> None:
+        """End-to-end run; stores the system + report in session state."""
         try:
-            report = system.run_forecast(p_df, e_df)
-        except Exception as exc:  # pragma: no cover
-            st.session_state.last_error = f"Forecast failed: {exc}\n{traceback.format_exc()}"
-            return None
-        self._log(f"Forecast complete for {horizon_days} days starting {forecast_start.date()}.")
-        self._save_to_r2(system)
+            cfg = self._build_config(start_date, end_date, horizon_days)
+            self._ensure_gauge_csv(uploaded_gauge, cfg)
+            self._ensure_dem(uploaded_dem, cfg)
+            user_met = self._ensure_met(uploaded_met)
 
-        return report
-
-    # ------------------------------------------------------------------
-    # UI sections
-    # ------------------------------------------------------------------
-    def render_sidebar(self) -> Dict[str, Any]:
-        """Render the control sidebar and return collected parameters."""
-        with st.sidebar:
-            st.header("1. Historical period")
-            start = st.date_input("Start date",
-                                    value=pd.to_datetime("2020-01-01").date(),
-                                    min_value=pd.to_datetime("1990-01-01").date(),
-                                    max_value=pd.to_datetime("2030-12-31").date())
-            end = st.date_input("End date",
-                                  value=pd.to_datetime("2024-12-31").date(),
-                                  min_value=start,
-                                  max_value=pd.to_datetime("2030-12-31").date())
-
-            st.header("2. Forecast horizon")
-            unit = st.radio("Unit", ["Days", "Weeks", "Months"], index=1,
-                             horizontal=True)
-            if unit == "Days":
-                horizon_val = st.slider("Forecast length (days)", 1, 60, 14)
-                horizon_days = int(horizon_val)
-            elif unit == "Weeks":
-                horizon_val = st.slider("Forecast length (weeks)", 1, 8, 2)
-                horizon_days = int(horizon_val * 7)
+            system = ffn.FloodForecastSystem(cfg)
+            if user_met is not None:
+                self._patch_with_user_met(system, cfg, user_met)
             else:
-                horizon_val = st.slider("Forecast length (months)", 1, 3, 1)
-                horizon_days = int(horizon_val * 30)
-            st.caption(f"Horizon = {horizon_days} day(s)")
+                system.run_historical()
+            self._log("Hindcast complete.")
 
-            st.header("3. Forecast start")
-            default_start = pd.to_datetime(end) + pd.Timedelta(days=1)
-            fc_start = st.date_input("Forecast start date",
-                                       value=default_start.date(),
-                                       min_value=pd.to_datetime(end).date())
+            system.config.forecast_horizon_days = int(horizon_days)
+            p_df, e_df = self._build_nwp(uploaded_nwp, horizon_days, forecast_start)
+            report = system.run_forecast(p_df, e_df)
+            self._log(f"Forecast complete ({horizon_days} days from {forecast_start.date()}).")
 
-            st.header("4. Data uploads")
-            gauge_file = st.file_uploader(
-                "Gauge stations CSV",
-                type=["csv"],
-                help="Columns: station_id, station_name, latitude, longitude, "
-                     "river, date, discharge_m3s, stage_m")
-            dem_file = st.file_uploader(
-                "DEM (GeoTIFF, optional)",
-                type=["tif", "tiff"],
-                help="Single-band elevation raster in WGS84. If omitted, a "
-                     "synthetic DEM is used.")
-            met_file = st.file_uploader(
-                "Meteorology CSV (optional)",
-                type=["csv"],
-                help="Columns: date, precip_mm, temp_c, pet_mm. If omitted, "
-                     "CHIRPS/ERA5 or synthetic data are used.")
-            nwp_file = st.file_uploader(
-                "Forecast precipitation CSV (optional)",
-                type=["csv"],
-                help="Columns: date plus either 'area_mean' or one column per "
-                     "station_id. A 'pet_mm' column is optional.")
+            st.session_state.system = system
+            st.session_state.forecast_report = report
+            st.session_state.forecast_date = forecast_start.strftime("%Y-%m-%d")
+            st.session_state.is_demo = is_demo
+            st.session_state.horizon_days = horizon_days
+            st.session_state.forecast_start = forecast_start
+            st.session_state.last_error = None
+        except Exception as exc:
+            tb = traceback.format_exc()
+            st.session_state.last_error = f"Pipeline failed: {exc}\n{tb}"
+            self._log(f"ERROR: {exc}")
 
-            st.header("5. Templates")
-            st.download_button(
-                "Gauge CSV template",
-                data=self._template_gauge_csv(),
-                file_name="gauge_template.csv",
-                mime="text/csv")
-            st.download_button(
-                "Met CSV template",
-                data=self._template_met_csv(),
-                file_name="met_template.csv",
-                mime="text/csv")
-            st.download_button(
-                "NWP CSV template",
-                data=self._template_nwp_csv(horizon_days),
-                file_name="nwp_template.csv",
-                mime="text/csv")
+    def _ensure_demo_system(self) -> None:
+        """Run a synthetic demo so the map has content on first load."""
+        if st.session_state.system is not None:
+            return
+        today = pd.Timestamp.today().normalize()
+        end = today - pd.Timedelta(days=1)
+        start = end - pd.Timedelta(days=365 * 2)
+        horizon = st.session_state.horizon_days or 14
+        fc_start = today
+        with st.spinner("Generating demo map (first visit only, ~30 s)..."):
+            self.run_pipeline(
+                uploaded_gauge=None, uploaded_dem=None,
+                uploaded_met=None, uploaded_nwp=None,
+                start_date=start.strftime("%Y-%m-%d"),
+                end_date=end.strftime("%Y-%m-%d"),
+                forecast_start=fc_start, horizon_days=horizon,
+                is_demo=True,
+            )
 
-            st.header("6. Actions")
-            run_clicked = st.button("Run pipeline", type="primary")
-            reset_clicked = st.button("Reset session")
+    # ------------------------------------------------------------------
+    # Map rendering (rivers + watersheds + stations + flood overlay)
+    # ------------------------------------------------------------------
+    def _basins_to_geojson(self, system: ffn.FloodForecastSystem):
+        """Convert the labelled-basin raster to polygon features."""
+        ws = getattr(system, "watershed_data", None)
+        if not ws:
+            return None
+        basins = ws.get("basins")
+        profile = ws.get("profile") or {}
+        if basins is None:
+            return None
+        rio_features = _try_import_rasterio_features()
+        if rio_features is None:
+            return None
+        transform = profile.get("transform")
+        if transform is None:
+            return None
+        try:
+            mask = basins.astype("int32")
+            shapes = rio_features.shapes(mask, mask=(mask > 0), transform=transform)
+            feats = []
+            for geom, val in shapes:
+                feats.append({
+                    "type": "Feature",
+                    "geometry": geom,
+                    "properties": {"basin_id": int(val)},
+                })
+            return feats
+        except Exception:
+            return None
 
-            if reset_clicked:
+    def _river_polylines(self, system: ffn.FloodForecastSystem) -> List[List[Tuple[float, float]]]:
+        ws = getattr(system, "watershed_data", None)
+        if not ws:
+            return []
+        rn = ws.get("river_network")
+        if rn is None:
+            return []
+        lines: List[List[Tuple[float, float]]] = []
+        try:
+            if hasattr(rn, "geometry"):
+                for geom in rn.geometry:
+                    if geom is None:
+                        continue
+                    if geom.geom_type == "LineString":
+                        lines.append([(y, x) for x, y in geom.coords])
+                    elif geom.geom_type == "MultiLineString":
+                        for part in geom.geoms:
+                            lines.append([(y, x) for x, y in part.coords])
+            elif isinstance(rn, list):
+                for seg in rn:
+                    if not seg:
+                        continue
+                    lines.append([(lat, lon) for lat, lon in seg])
+        except Exception:
+            pass
+        return lines
+
+    def _station_records(self, system: ffn.FloodForecastSystem,
+                         report: Optional[Dict[str, Dict[str, Any]]]):
+        dm = getattr(system, "data_manager", None)
+        if dm is None:
+            return []
+        gdf = dm.get_station_geodataframe()
+        recs = []
+        for _, row in gdf.iterrows():
+            sid = row.get("station_id")
+            lat = float(row.get("latitude", np.nan))
+            lon = float(row.get("longitude", np.nan))
+            if not (np.isfinite(lat) and np.isfinite(lon)):
+                continue
+            alert = (report or {}).get(sid, {})
+            recs.append({
+                "station_id": sid,
+                "name": row.get("station_name", sid),
+                "river": row.get("river", ""),
+                "lat": lat, "lon": lon,
+                "alert_level": alert.get("alert_level", "GREEN"),
+                "peak_Q": alert.get("peak_Q_m3s", np.nan),
+                "peak_date": alert.get("peak_date", ""),
+                "pct_2yr": alert.get("Q_pct_of_2yr", np.nan),
+            })
+        return recs
+
+    def _build_map_html(self, system: ffn.FloodForecastSystem,
+                        report: Optional[Dict[str, Dict[str, Any]]],
+                        forecast_date: Optional[str]) -> Optional[str]:
+        folium = _try_import_folium()
+        if folium is None:
+            return None
+
+        # Center on the centroid of stations, or Nigeria as fallback.
+        recs = self._station_records(system, report)
+        if recs:
+            lat0 = float(np.mean([r["lat"] for r in recs]))
+            lon0 = float(np.mean([r["lon"] for r in recs]))
+        else:
+            lat0, lon0 = 9.1, 8.7
+
+        fmap = folium.Map(location=[lat0, lon0], zoom_start=6,
+                          tiles="CartoDB positron", control_scale=True)
+
+        # --- Watershed polygons ---
+        basin_feats = self._basins_to_geojson(system)
+        if basin_feats:
+            fg_b = folium.FeatureGroup(name="Watersheds", show=True)
+            palette = ["#5DADE2", "#48C9B0", "#F5B041", "#AF7AC5",
+                       "#EC7063", "#58D68D", "#F4D03F", "#5D6D7E"]
+            for feat in basin_feats:
+                bid = int(feat["properties"]["basin_id"])
+                color = palette[bid % len(palette)]
+                folium.GeoJson(
+                    feat,
+                    style_function=lambda _x, c=color: {
+                        "fillColor": c, "color": "#2C3E50",
+                        "weight": 1.0, "fillOpacity": 0.28,
+                    },
+                    tooltip=f"Basin {bid}",
+                ).add_to(fg_b)
+            fg_b.add_to(fmap)
+
+        # --- River network ---
+        lines = self._river_polylines(system)
+        if lines:
+            fg_r = folium.FeatureGroup(name="River network", show=True)
+            for line in lines:
+                folium.PolyLine(line, color="#1F618D", weight=2.2,
+                                opacity=0.85).add_to(fg_r)
+            fg_r.add_to(fmap)
+
+        # --- Flood extent overlay (RiverREM based HAND) ---
+        try:
+            ad = getattr(system, "alert_dashboard", None)
+            if ad is not None and forecast_date is not None:
+                peak_map = system.flood_router.get_peak_flood_map(forecast_date) \
+                    if hasattr(system, "flood_router") else None
+                # AlertDashboard may have generated a dedicated HTML already;
+                # overlay the raster if available in watershed_data.
+                ws = getattr(system, "watershed_data", None) or {}
+                dem = ws.get("dem")
+                profile = ws.get("profile") or {}
+                rio_features = _try_import_rasterio_features()
+                if dem is not None and profile.get("transform") is not None \
+                        and peak_map is not None and rio_features is not None:
+                    flood = peak_map.get("inundation") if isinstance(peak_map, dict) else None
+                    if flood is not None:
+                        mask = (flood > 0).astype("uint8")
+                        if mask.any():
+                            fg_f = folium.FeatureGroup(name="Peak flood extent",
+                                                       show=True)
+                            shapes = rio_features.shapes(
+                                mask, mask=mask.astype(bool),
+                                transform=profile["transform"])
+                            for geom, _v in shapes:
+                                folium.GeoJson(
+                                    geom,
+                                    style_function=lambda _x: {
+                                        "fillColor": "#1E3A8A",
+                                        "color": "#1E3A8A",
+                                        "weight": 0, "fillOpacity": 0.45,
+                                    },
+                                ).add_to(fg_f)
+                            fg_f.add_to(fmap)
+        except Exception:
+            pass  # overlay is cosmetic; never block the map
+
+        # --- Station markers ---
+        if recs:
+            fg_s = folium.FeatureGroup(name="Gauge stations", show=True)
+            for r in recs:
+                c = self.ALERT_HEX.get(r["alert_level"], "#2C3E50")
+                pct = r["pct_2yr"]
+                pct_s = f"{pct:.0f}%" if np.isfinite(pct) else "n/a"
+                popup = (f"<b>{r['name']}</b> ({r['station_id']})<br>"
+                         f"River: {r['river']}<br>"
+                         f"Alert: <b>{r['alert_level']}</b><br>"
+                         f"Peak Q: {r['peak_Q']:.1f} m³/s<br>"
+                         f"% of 2-yr RP: {pct_s}<br>"
+                         f"Peak date: {r['peak_date'][:10]}")
+                folium.CircleMarker(
+                    [r["lat"], r["lon"]],
+                    radius=8, color="#212F3C", weight=1.5,
+                    fill=True, fill_color=c, fill_opacity=0.9,
+                    popup=folium.Popup(popup, max_width=280),
+                    tooltip=f"{r['station_id']} — {r['alert_level']}",
+                ).add_to(fg_s)
+            fg_s.add_to(fmap)
+
+        # Legend
+        try:
+            from branca.element import MacroElement, Template
+            legend_html = """
+            {% macro html(this, kwargs) %}
+            <div style="position: fixed; bottom: 22px; left: 22px; z-index: 9999;
+                        background: white; padding: 10px 14px; border-radius: 6px;
+                        box-shadow: 0 1px 4px rgba(0,0,0,0.25); font: 12px/1.4 sans-serif;">
+              <b>Legend</b><br>
+              <span style='display:inline-block;width:12px;height:12px;background:#C0392B;border-radius:50%;'></span> RED alert<br>
+              <span style='display:inline-block;width:12px;height:12px;background:#F39C12;border-radius:50%;'></span> AMBER alert<br>
+              <span style='display:inline-block;width:12px;height:12px;background:#27AE60;border-radius:50%;'></span> GREEN alert<br>
+              <span style='display:inline-block;width:14px;height:3px;background:#1F618D;'></span> River<br>
+              <span style='display:inline-block;width:14px;height:10px;background:rgba(93,173,226,0.4);border:1px solid #2C3E50;'></span> Watershed<br>
+              <span style='display:inline-block;width:14px;height:10px;background:rgba(30,58,138,0.5);'></span> Flood extent
+            </div>
+            {% endmacro %}
+            """
+            macro = MacroElement()
+            macro._template = Template(legend_html)
+            fmap.get_root().add_child(macro)
+        except Exception:
+            pass
+
+        folium.LayerControl(collapsed=False).add_to(fmap)
+        try:
+            return fmap.get_root().render()
+        except Exception:
+            return fmap._repr_html_()
+
+    # ------------------------------------------------------------------
+    # Navigation sidebar
+    # ------------------------------------------------------------------
+    def render_nav(self) -> None:
+        with st.sidebar:
+            st.markdown("<div class='nav-title'>Navigation</div>",
+                        unsafe_allow_html=True)
+            st.session_state.page = st.radio(
+                " ", self.PAGES,
+                index=self.PAGES.index(st.session_state.page),
+                label_visibility="collapsed",
+            )
+            st.divider()
+            system = st.session_state.system
+            if system is None:
+                st.caption("No run yet.")
+            else:
+                mode = "Demo run" if st.session_state.is_demo else "User data run"
+                n = len(system.routed_Q) if getattr(system, "routed_Q", None) else 0
+                st.caption(f"**{mode}** — {n} basin(s)")
+                st.caption(f"Horizon: {st.session_state.horizon_days} day(s)")
+                if st.session_state.forecast_date:
+                    st.caption(f"Forecast start: {st.session_state.forecast_date}")
+            st.divider()
+            if st.button("Reset session"):
                 self._reset_workdir()
                 st.rerun()
 
-        return {
-            "start_date": str(start),
-            "end_date": str(end),
-            "horizon_days": horizon_days,
-            "forecast_start": pd.to_datetime(fc_start),
-            "gauge_file": gauge_file,
-            "dem_file": dem_file,
-            "met_file": met_file,
-            "nwp_file": nwp_file,
-            "run_clicked": run_clicked,
-        }
+    # ------------------------------------------------------------------
+    # Pages
+    # ------------------------------------------------------------------
+    def page_map(self) -> None:
+        st.title("Nigeria flood-forecast map")
+        self._ensure_demo_system()
+        system = st.session_state.system
+        report = st.session_state.forecast_report
+        forecast_date = st.session_state.forecast_date
+        if system is None:
+            st.error(st.session_state.last_error or "Map could not be generated.")
+            return
+        mode_badge = ("🟡 **Demo data** — upload your own on the Upload page "
+                      "to refresh this map."
+                      if st.session_state.is_demo
+                      else "🟢 **Using uploaded data.**")
+        st.info(mode_badge)
+        html = self._build_map_html(system, report, forecast_date)
+        if html is None:
+            # Fall back to the ffn-produced map file if our builder failed.
+            map_path = Path(system.config.output_dir) / f"flood_map_{forecast_date}.html"
+            if map_path.exists():
+                html = map_path.read_text(encoding="utf-8")
+        if html:
+            components.html(html, height=720, scrolling=False)
+            st.download_button(
+                "Download map HTML",
+                data=html.encode("utf-8"),
+                file_name="flood_map.html",
+                mime="text/html",
+            )
+        else:
+            st.warning("Folium is not installed; cannot render the interactive map.")
+
+        # Summary metrics
+        if report:
+            red = sum(1 for r in report.values() if r["alert_level"] == "RED")
+            amber = sum(1 for r in report.values() if r["alert_level"] == "AMBER")
+            green = sum(1 for r in report.values() if r["alert_level"] == "GREEN")
+            peak = max((r["peak_Q_m3s"] for r in report.values()), default=0.0)
+            c = st.columns(4)
+            c[0].metric("RED alerts", red)
+            c[1].metric("AMBER alerts", amber)
+            c[2].metric("GREEN alerts", green)
+            c[3].metric("Peak Q (m³/s)", f"{peak:,.0f}")
 
     # ------------------------------------------------------------------
-    def render_header(self) -> None:
-        """Title + brief description banner."""
-        st.title("Nigeria Flood Forecast Dashboard")
+    def page_upload(self) -> None:
+        st.title("Upload data & run forecast")
         st.markdown(
-            "Upload your own gauge records, DEM and meteorology, pick a "
-            "forecast horizon (day / week / month) and get routed-discharge "
-            "forecasts, inundation maps and colour-coded alerts across every "
-            "sub-basin.")
+            "Upload whichever of the four files you have — anything missing is "
+            "replaced with realistic synthetic data. The map auto-refreshes "
+            "against your upload once you press **Run forecast**."
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("Historical period")
+            start = st.date_input(
+                "Start date",
+                value=pd.to_datetime("2022-01-01").date(),
+                min_value=pd.to_datetime("1990-01-01").date(),
+                max_value=pd.to_datetime("2035-12-31").date(),
+            )
+            end = st.date_input(
+                "End date",
+                value=pd.to_datetime("2024-12-31").date(),
+                min_value=start,
+                max_value=pd.to_datetime("2035-12-31").date(),
+            )
+        with col_b:
+            st.subheader("Forecast horizon")
+            unit = st.radio("Unit", ["Days", "Weeks", "Months"],
+                            index=1, horizontal=True)
+            if unit == "Days":
+                v = st.slider("Length (days)", 1, 60, 14)
+                horizon_days = v
+            elif unit == "Weeks":
+                v = st.slider("Length (weeks)", 1, 8, 2)
+                horizon_days = v * 7
+            else:
+                v = st.slider("Length (months)", 1, 3, 1)
+                horizon_days = v * 30
+            st.caption(f"= **{horizon_days} day(s)**")
+            default_fc = pd.to_datetime(end) + pd.Timedelta(days=1)
+            fc_start = st.date_input(
+                "Forecast start date",
+                value=default_fc.date(),
+                min_value=pd.to_datetime(end).date(),
+            )
+
+        st.subheader("Files")
+        f1, f2 = st.columns(2)
+        with f1:
+            gauge_file = st.file_uploader(
+                "Gauge stations CSV",
+                type=["csv"],
+                help="station_id, station_name, latitude, longitude, river, "
+                     "date, discharge_m3s, stage_m",
+            )
+            dem_file = st.file_uploader(
+                "DEM (GeoTIFF, optional)",
+                type=["tif", "tiff"],
+                help="Single-band elevation raster in WGS84.",
+            )
+        with f2:
+            met_file = st.file_uploader(
+                "Meteorology CSV (optional)",
+                type=["csv"],
+                help="date, precip_mm, temp_c, pet_mm",
+            )
+            nwp_file = st.file_uploader(
+                "Forecast precipitation CSV (optional)",
+                type=["csv"],
+                help="date + area_mean (or one column per station_id); optional pet_mm.",
+            )
+
+        st.subheader("Templates")
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.download_button("Gauge CSV template",
+                               data=self._template_gauge_csv(),
+                               file_name="gauge_template.csv",
+                               mime="text/csv")
+        with t2:
+            st.download_button("Met CSV template",
+                               data=self._template_met_csv(),
+                               file_name="met_template.csv",
+                               mime="text/csv")
+        with t3:
+            st.download_button("NWP CSV template",
+                               data=self._template_nwp_csv(horizon_days),
+                               file_name="nwp_template.csv",
+                               mime="text/csv")
+
+        st.divider()
+        run = st.button("🚀  Run forecast with these inputs", type="primary")
+        if run:
+            if horizon_days < 1:
+                st.error("Horizon must be ≥ 1 day.")
+                return
+            if horizon_days > 60:
+                st.warning("Horizons > 60 days are extrapolative — proceeding.")
+            is_demo = not any([gauge_file, dem_file, met_file, nwp_file])
+            # Purge previous workdir so nothing stale leaks in.
+            self._reset_workdir()
+            with st.spinner("Calibrating GR4J per basin and routing the network..."):
+                self.run_pipeline(
+                    uploaded_gauge=gauge_file,
+                    uploaded_dem=dem_file,
+                    uploaded_met=met_file,
+                    uploaded_nwp=nwp_file,
+                    start_date=str(start),
+                    end_date=str(end),
+                    forecast_start=pd.to_datetime(fc_start),
+                    horizon_days=int(horizon_days),
+                    is_demo=is_demo,
+                )
+            if st.session_state.last_error:
+                st.error(st.session_state.last_error)
+            else:
+                st.success("Forecast complete — switch to the Map tab.")
+                st.session_state.page = self.PAGES[0]
+                st.rerun()
 
     # ------------------------------------------------------------------
-    def render_metrics(self, report: Dict[str, Dict[str, Any]]) -> None:
-        """Top metric row showing alert counts and peak discharge."""
-        if not report:
+    def page_forecast(self) -> None:
+        st.title("Forecast & alerts")
+        system = st.session_state.system
+        report = st.session_state.forecast_report
+        if system is None or report is None:
+            st.info("Run the pipeline first.")
             return
         red = sum(1 for r in report.values() if r["alert_level"] == "RED")
         amber = sum(1 for r in report.values() if r["alert_level"] == "AMBER")
         green = sum(1 for r in report.values() if r["alert_level"] == "GREEN")
-        peak = max(r["peak_Q_m3s"] for r in report.values())
-        cols = st.columns(4)
-        cols[0].metric("RED alerts", red)
-        cols[1].metric("AMBER alerts", amber)
-        cols[2].metric("GREEN alerts", green)
-        cols[3].metric("Peak forecast Q (m^3/s)", f"{peak:,.0f}")
+        peak = max((r["peak_Q_m3s"] for r in report.values()), default=0.0)
+        c = st.columns(4)
+        c[0].metric("RED", red)
+        c[1].metric("AMBER", amber)
+        c[2].metric("GREEN", green)
+        c[3].metric("Peak Q (m³/s)", f"{peak:,.0f}")
 
-    # ------------------------------------------------------------------
-    def render_map_tab(self, system: ffn.FloodForecastSystem,
-                        forecast_date: str) -> None:
-        """Render the folium map tab."""
-        st.subheader("Inundation & station map")
-        map_path = Path(system.config.output_dir) / f"flood_map_{forecast_date}.html"
-        if not map_path.exists() and system.alert_dashboard is not None:
-            try:
-                system.alert_dashboard.generate_folium_map(forecast_date)
-            except Exception as exc:
-                st.warning(f"Could not regenerate map: {exc}")
-        if map_path.exists():
-            try:
-                with open(map_path, "r", encoding="utf-8") as fh:
-                    html = fh.read()
-                components.html(html, height=650, scrolling=True)
-                st.download_button(
-                    "Download map HTML",
-                    data=html.encode("utf-8"),
-                    file_name=map_path.name,
-                    mime="text/html")
-            except Exception as exc:
-                st.error(f"Failed to load map: {exc}")
-        else:
-            st.info("Map not yet generated.")
-
-    # ------------------------------------------------------------------
-    def render_plot_tab(self, system: ffn.FloodForecastSystem,
-                         selected_stations: List[str]) -> None:
-        """Render per-station forecast PNGs."""
-        st.subheader("Per-station discharge forecasts")
-        if not selected_stations:
-            st.info("Select one or more basins in the sidebar filter below.")
-            return
-        for sid in selected_stations:
-            img = Path(system.config.output_dir) / f"{sid}_forecast.png"
-            if img.exists():
-                st.image(str(img), caption=sid, use_column_width=True)
-            else:
-                st.write(f"No forecast plot produced for {sid}")
-
-    # ------------------------------------------------------------------
-    def render_alert_tab(self, report: Dict[str, Dict[str, Any]]) -> None:
-        """Coloured alert table + individual alert banners."""
-        st.subheader("Alert table")
-        if not report:
-            st.info("No alerts yet.")
-            return
-        df = pd.DataFrame.from_dict(report, orient="index").reset_index()
-        df = df.rename(columns={"index": "station_id"})
-        numeric_cols = [c for c in df.columns
-                         if df[c].dtype.kind in "fc" and c not in ("station_id",)]
-        for c in numeric_cols:
-            df[c] = df[c].astype(float).round(2)
+        df = pd.DataFrame.from_dict(report, orient="index").reset_index() \
+            .rename(columns={"index": "station_id"})
+        for col in df.columns:
+            if df[col].dtype.kind in "fc":
+                df[col] = df[col].astype(float).round(2)
 
         def color_row(row):
             c = {"RED": "#fadbd8", "AMBER": "#fdebd0",
@@ -626,8 +828,8 @@ class FloodForecastWebApp:
             return [f"background-color: {c}"] * len(row)
 
         try:
-            styled = df.style.apply(color_row, axis=1)
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+            st.dataframe(df.style.apply(color_row, axis=1),
+                         use_container_width=True, hide_index=True)
         except Exception:
             st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -635,190 +837,150 @@ class FloodForecastWebApp:
             "Download alerts JSON",
             data=json.dumps(report, indent=2, default=str).encode("utf-8"),
             file_name="alert_report.json",
-            mime="application/json")
+            mime="application/json",
+        )
 
-        st.markdown("#### Individual alerts")
-        for sid, rec in sorted(report.items(),
-                                 key=lambda kv: ["RED", "AMBER", "GREEN"].index(kv[1]["alert_level"])):
-            lvl = rec["alert_level"]
-            cls = {"RED": "alert-red", "AMBER": "alert-amber", "GREEN": "alert-green"}[lvl]
-            pct = rec.get("Q_pct_of_2yr", float("nan"))
-            pct_str = f"{pct:.1f}%" if np.isfinite(pct) else "n/a"
-            st.markdown(
-                f'<div class="{cls}"><b>{sid}</b> ({rec["river"]}) - '
-                f'<b>{lvl}</b>, peak {rec["peak_Q_m3s"]:.1f} m^3/s on '
-                f'{rec["peak_date"][:10]} ({pct_str} of 2-yr RP)</div>',
-                unsafe_allow_html=True)
+        st.subheader("Per-station forecast plots")
+        station_ids = list(system.routed_Q.keys())
+        picks = st.multiselect("Stations", station_ids, default=station_ids)
+        for sid in picks:
+            img = Path(system.config.output_dir) / f"{sid}_forecast.png"
+            if img.exists():
+                st.image(str(img), caption=sid, use_container_width=True)
+            else:
+                st.caption(f"(no plot for {sid})")
 
     # ------------------------------------------------------------------
-    def render_data_tab(self, system: ffn.FloodForecastSystem) -> None:
-        """Raw-data exports and return-period tables."""
-        st.subheader("Raw data export")
-        if not system.routed_Q:
+    def page_data(self) -> None:
+        st.title("Raw data")
+        system = st.session_state.system
+        if system is None or not getattr(system, "routed_Q", None):
             st.info("Run the pipeline first.")
             return
-        station = st.selectbox("Station", list(system.routed_Q.keys()),
-                                 key="export_station")
-        tabs = st.tabs(["Routed discharge", "Forecast", "Return periods"])
-        with tabs[0]:
-            df = system.routed_Q[station]
-            st.line_chart(df["Q_routed_m3s"].tail(365), height=260)
+        sid = st.selectbox("Station", list(system.routed_Q.keys()))
+        t1, t2, t3 = st.tabs(["Routed discharge", "Forecast", "Return periods"])
+        with t1:
+            df = system.routed_Q[sid]
+            st.line_chart(df["Q_routed_m3s"].tail(365), height=280)
             st.download_button(
-                f"Download routed Q for {station} (CSV)",
+                f"Download routed Q for {sid}",
                 data=df.to_csv().encode("utf-8"),
-                file_name=f"{station}_routed_Q.csv",
-                mime="text/csv")
-        with tabs[1]:
-            fc = (system.alert_dashboard.forecasts.get(station)
-                   if system.alert_dashboard else None)
-            if fc is not None and len(fc) > 0:
+                file_name=f"{sid}_routed_Q.csv",
+                mime="text/csv",
+            )
+        with t2:
+            fc = (system.alert_dashboard.forecasts.get(sid)
+                  if system.alert_dashboard else None)
+            if fc is not None and len(fc):
                 st.dataframe(fc, use_container_width=True)
                 st.download_button(
-                    f"Download forecast for {station} (CSV)",
+                    f"Download forecast for {sid}",
                     data=fc.to_csv().encode("utf-8"),
-                    file_name=f"{station}_forecast.csv",
-                    mime="text/csv")
+                    file_name=f"{sid}_forecast.csv",
+                    mime="text/csv",
+                )
             else:
-                st.info("No forecast data for this station.")
-        with tabs[2]:
-            rp = system.return_periods.get(station)
-            if rp is not None and len(rp) > 0:
+                st.info("No forecast data.")
+        with t3:
+            rp = system.return_periods.get(sid)
+            if rp is not None and len(rp):
                 st.dataframe(rp, use_container_width=True, hide_index=True)
                 st.download_button(
-                    f"Download return periods for {station} (CSV)",
+                    f"Download return periods for {sid}",
                     data=rp.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{station}_return_periods.csv",
-                    mime="text/csv")
+                    file_name=f"{sid}_return_periods.csv",
+                    mime="text/csv",
+                )
 
     # ------------------------------------------------------------------
-    def render_log_tab(self) -> None:
-        """Show the per-run log and any error traceback."""
-        st.subheader("Run log")
+    def page_instructions(self) -> None:
+        st.title("Instructions")
+        st.markdown("""
+### What you're looking at
+The **Map** page is the landing view and always shows a live forecast —
+a synthetic demo run on first load, or your uploaded data after you run the
+pipeline.  It overlays:
+
+- **Watershed polygons** — derived from the DEM via D8 flow-direction.
+- **River network** — streams above the area-threshold drainage density.
+- **Peak flood extent** — HAND / RiverREM-based inundation at the forecast horizon.
+- **Gauge stations** — coloured by alert level (RED / AMBER / GREEN).
+
+### How to use your own data
+1. Open **Upload Data** in the left menu.
+2. Pick a historical period, a forecast unit (**Days / Weeks / Months**) and a length.
+   *Default is 2 weeks ahead.*
+3. Upload any combination of:
+   - Gauge CSV — `station_id, station_name, latitude, longitude, river, date, discharge_m3s, stage_m`
+   - DEM GeoTIFF — single-band elevation, WGS84
+   - Met CSV — `date, precip_mm, temp_c, pet_mm`
+   - Forecast precipitation CSV — `date + area_mean` (or one column per station) and optional `pet_mm`
+4. Press **Run forecast**. The Map refreshes automatically.
+
+### Models used under the hood
+- **Watershed delineation** — pysheds D8 (with a pure-NumPy fallback).
+- **Gap filling** — IDW spatial interpolation + a windowed multivariate
+  regression surrogate for short records.
+- **Rainfall-runoff** — GR4J (Perrin et al. 2003) calibrated per basin with
+  Kling-Gupta Efficiency via `scipy.optimize.differential_evolution`.
+- **Channel routing** — Muskingum with C0+C1+C2 stability check.
+- **Frequency analysis** — Gumbel EV-I return-period fit for 2 / 5 / 10 /
+  25 / 50 / 100-yr flows.
+- **Inundation** — RiverREM / HAND via `scipy.ndimage.distance_transform_edt`.
+- **Alert triage** — station-level RED ≥ Q₂-yr, AMBER ≥ 0.7·Q₂-yr, else GREEN.
+
+### Tips
+- The app works with **no uploads at all** — the default demo exercises
+  every model and is a good sanity check before committing your data.
+- Use the **Reset session** button at the bottom of the sidebar if you
+  want to wipe cached results without refreshing the browser.
+- All outputs — routed Q, forecasts, return periods, alerts, the map HTML —
+  are downloadable from the Forecast & Alerts and Raw Data pages.
+        """)
+
+    # ------------------------------------------------------------------
+    def page_about(self) -> None:
+        st.title("About")
+        st.markdown("""
+This dashboard is a thin Streamlit UI on top of
+`flood_forecast_nigeria.py`, which implements the full eight-class
+hydrological pipeline (Config, DataManager, GapFiller, WatershedDelineator,
+HydrologicalModel, FloodRouter, AlertDashboard, FloodForecastSystem).
+
+The web layer never modifies the pipeline — it only orchestrates uploads,
+overrides the forecast horizon, and renders the outputs.
+
+### Run log
+""")
         if st.session_state.run_log:
             st.code("\n".join(st.session_state.run_log), language="text")
         else:
-            st.info("Nothing logged yet.")
+            st.caption("Nothing logged yet.")
         if st.session_state.last_error:
             st.error(st.session_state.last_error)
 
     # ------------------------------------------------------------------
-    def render_about_tab(self) -> None:
-        """Static "About / Help" tab."""
-        st.markdown("""
-        ### How it works
-
-        1. **Upload** your gauge CSV, optional DEM and optional met CSV in the sidebar.
-        2. **Pick a forecast horizon** (any number of days, weeks or months, up to
-           60 days) and a start date.
-        3. **Click "Run pipeline"**. The app will, in order:
-           - load and QC your gauge data,
-           - fill any stations with < 3 years of record,
-           - delineate watersheds from the DEM,
-           - calibrate a GR4J model per basin against your observations (using
-             `scipy.optimize.differential_evolution` and Kling-Gupta Efficiency),
-           - route forecast discharges with Muskingum channel routing,
-           - build a RiverREM-based inundation map,
-           - classify each station as RED / AMBER / GREEN against its mean
-             annual flood.
-        4. **Inspect results** in the four tabs above.
-
-        ### Expected CSV formats
-        - **Gauge CSV** — `station_id, station_name, latitude, longitude, river,
-          date, discharge_m3s, stage_m`
-        - **Meteorology CSV** — `date, precip_mm, temp_c, pet_mm`
-        - **NWP CSV** — `date` plus either `area_mean` or one column per
-          `station_id`; an optional `pet_mm` column is used if present.
-
-        ### Notes
-        - Without a Copernicus CDS API key, the app falls back to a bundled
-          synthetic meteorology model (seasonal gamma rainfall, sinusoidal
-          temperature, Hargreaves PET).
-        - CHIRPS downloads are attempted when no met CSV is supplied, but
-          silently fall back to synthetic data if the server is unreachable.
-        - All computation is delegated to the eight classes in
-          `flood_forecast_nigeria.py` - this web app is pure UI + I/O.
-        """)
-
-    # ------------------------------------------------------------------
     def render(self) -> None:
-        """Main entry: wire up sidebar + main panel for a single rerun."""
-        self.render_header()
-        params = self.render_sidebar()
-
-        if params["run_clicked"]:
-            # Validate horizon against start date to avoid empty forecasts.
-            horizon_days = int(params["horizon_days"])
-            if horizon_days < 1:
-                st.error("Forecast horizon must be at least 1 day.")
-                return
-            if horizon_days > 60:
-                st.warning("Horizons > 60 days are extrapolative and unreliable "
-                            "given the underlying GR4J state - proceeding anyway.")
-
-            with st.spinner("Running hindcast and calibrating GR4J... this may take a minute."):
-                system = self.run_historical(
-                    params["gauge_file"], params["dem_file"], params["met_file"],
-                    params["start_date"], params["end_date"], horizon_days)
-            if system is None:
-                st.error(st.session_state.last_error or "Hindcast failed.")
-                return
-
-            with st.spinner(f"Running {horizon_days}-day forecast..."):
-                report = self.run_forecast(system, params["nwp_file"],
-                                             params["forecast_start"], horizon_days)
-            if report is None:
-                st.error(st.session_state.last_error or "Forecast failed.")
-                return
-
-            st.session_state.system = system
-            st.session_state.forecast_report = report
-            st.session_state.forecast_date = params["forecast_start"].strftime("%Y-%m-%d")
-            st.session_state.pipeline_ready = True
-
-        if not st.session_state.pipeline_ready:
-            st.info("Configure the sidebar and press **Run pipeline** to get started. "
-                     "You can run a full demo with zero uploads.")
-            self.render_about_tab()
-            return
-
-        system: ffn.FloodForecastSystem = st.session_state.system
-        report: Dict[str, Dict[str, Any]] = st.session_state.forecast_report
-        forecast_date: str = st.session_state.forecast_date
-
-        self.render_metrics(report)
-
-        all_stations = list(system.routed_Q.keys())
-        level_filter = st.multiselect(
-            "Filter alert levels",
-            ["RED", "AMBER", "GREEN"], default=["RED", "AMBER", "GREEN"])
-        visible = [sid for sid, rec in report.items()
-                    if rec["alert_level"] in level_filter]
-        station_filter = st.multiselect(
-            "Stations", all_stations, default=visible or all_stations)
-
-        filtered_report = {sid: rec for sid, rec in report.items()
-                            if sid in station_filter and rec["alert_level"] in level_filter}
-
-        tabs = st.tabs(["Map", "Forecast plots", "Alert table", "Raw data", "Log", "About"])
-        with tabs[0]:
-            self.render_map_tab(system, forecast_date)
-        with tabs[1]:
-            self.render_plot_tab(system, station_filter)
-        with tabs[2]:
-            self.render_alert_tab(filtered_report)
-        with tabs[3]:
-            self.render_data_tab(system)
-        with tabs[4]:
-            self.render_log_tab()
-        with tabs[5]:
-            self.render_about_tab()
+        self.render_nav()
+        page = st.session_state.page
+        if page == self.PAGES[0]:
+            self.page_map()
+        elif page == self.PAGES[1]:
+            self.page_upload()
+        elif page == self.PAGES[2]:
+            self.page_forecast()
+        elif page == self.PAGES[3]:
+            self.page_data()
+        elif page == self.PAGES[4]:
+            self.page_instructions()
+        else:
+            self.page_about()
 
 
 # ===========================================================================
-#                              Entry point
+#                               Entry point
 # ===========================================================================
 def main() -> None:
-    """Streamlit scripts rerun top-to-bottom; instantiate and render each time."""
     app = FloodForecastWebApp()
     app.render()
 
@@ -826,6 +988,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 else:
-    # Streamlit imports the script under `__mp_main__`, not `__main__`, so we
-    # trigger the render on module load as well.
+    # Streamlit imports the script under `__mp_main__`, not `__main__`.
     main()
