@@ -28,9 +28,10 @@ except Exception:
 #                          CONSTANTS / CONFIG
 # ===========================================================================
 
-# Nigeria bounding box for fit_bounds + max_bounds (lat_min, lon_min, lat_max, lon_max).
-NIGERIA_BOUNDS = [[3.8, 2.3], [14.2, 15.0]]
-NIGERIA_CENTER = [9.0, 8.1]
+# Nigeria bounding box for fit_bounds (lat_min, lon_min, lat_max, lon_max)
+# Adjusted to show the full country
+NIGERIA_BOUNDS = [[4.0, 2.5], [14.0, 14.7]]
+NIGERIA_CENTER = [9.5, 8.0]
 
 # Named rivers we want to promote to "major" styling when they appear in OSM.
 MAJOR_RIVER_NAMES = {
@@ -220,11 +221,9 @@ class ProfessionalDataManager:
                         waterway = str(waterway).lower()
 
                         # Promote named major rivers to "major_river" class
-                        # so they render with heavier styling.
                         category = waterway
                         if waterway == 'river' and name:
                             lname = name.lower().strip()
-                            # match whole-word against MAJOR_RIVER_NAMES
                             if any(re.search(rf"\b{re.escape(m)}\b", lname)
                                    for m in MAJOR_RIVER_NAMES):
                                 category = 'major_river'
@@ -407,19 +406,21 @@ class FloodForecastWebApp:
 
         fmap = folium.Map(
             location=NIGERIA_CENTER,
-            zoom_start=6,
-            min_zoom=5,
-            max_zoom=14,
+            zoom_start=6.5,
+            min_zoom=5.5,
+            max_zoom=12,
             max_bounds=True,
             tiles="CartoDB positron",
             control_scale=True,
             zoom_control=True,
         )
+        # Fit bounds to show all of Nigeria
         fmap.fit_bounds(NIGERIA_BOUNDS)
-        # Constrain panning so the user stays on Nigeria.
+        
+        # Constrain panning so the user stays on Nigeria
         fmap.options['maxBounds'] = [
-            [NIGERIA_BOUNDS[0][0] - 1, NIGERIA_BOUNDS[0][1] - 1],
-            [NIGERIA_BOUNDS[1][0] + 1, NIGERIA_BOUNDS[1][1] + 1],
+            [NIGERIA_BOUNDS[0][0] - 2, NIGERIA_BOUNDS[0][1] - 2],
+            [NIGERIA_BOUNDS[1][0] + 2, NIGERIA_BOUNDS[1][1] + 2],
         ]
 
         # Fullscreen + mouse coords
@@ -502,7 +503,6 @@ class FloodForecastWebApp:
             drains = collect(lambda p: p.get('waterway')
                              in ('drain', 'ditch', 'tidal_channel'))
 
-            # draw order: drains → streams → canals → rivers → major
             def add_layer(fc, name, show, style):
                 if not fc:
                     return
@@ -564,22 +564,23 @@ class FloodForecastWebApp:
     # Page: Map
     # ------------------------------------------------------------------
     def _render_map_page(self):
-        # Strip chrome so the map fills the viewport.
+        # Keep sidebar visible but make map fill remaining space
         st.markdown(
             """
             <style>
-            #MainMenu, header, footer { visibility: hidden; }
+            #MainMenu, header { visibility: hidden; }
+            footer { display: none; }
             .block-container {
-                padding: 0 !important;
+                padding-top: 0 !important;
+                padding-bottom: 0 !important;
                 max-width: 100% !important;
             }
             section[data-testid="stSidebar"] > div {
                 padding-top: 1rem;
             }
-            .stApp > header { display: none; }
             .element-container iframe {
                 width: 100% !important;
-                height: calc(100vh - 10px) !important;
+                height: calc(100vh - 80px) !important;
                 border: 0 !important;
             }
             </style>
@@ -597,8 +598,7 @@ class FloodForecastWebApp:
 
         html = self._build_map_html()
         if html:
-            # Large height; the CSS above forces it to viewport height.
-            components.html(html, height=1200, scrolling=False)
+            components.html(html, height=800, scrolling=False)
         else:
             st.error("Could not generate map. Check R2 contents.")
 
@@ -656,26 +656,57 @@ class FloodForecastWebApp:
     # Render
     # ------------------------------------------------------------------
     def render(self):
+        # Navigation sidebar - always visible
         with st.sidebar:
-            st.markdown("### Navigation")
+            st.markdown("### 🗺️ Navigation")
             st.session_state.page = st.radio(
-                "Page", self.PAGES, key="nav_page_radio",
+                "Menu",
+                self.PAGES,
+                key="nav_page_radio",
                 label_visibility="collapsed",
             )
             st.markdown("---")
             if st.session_state.r2_connected:
-                st.caption("✅ R2 connected")
+                st.success("✅ R2 connected")
             else:
-                st.caption("⚠️ R2 not configured")
+                st.warning("⚠️ R2 not configured")
 
         page = st.session_state.page
         if page == self.PAGES[0]:
             self._render_map_page()
         elif page == self.PAGES[1]:
             self._render_upload_page()
-        else:
-            st.title(page.strip())
-            st.info("Page under construction.")
+        elif page == self.PAGES[2]:
+            st.title("Forecast & Alerts")
+            st.info("Forecast system will be displayed here.")
+        elif page == self.PAGES[3]:
+            st.title("Raw Data")
+            st.info("Raw data export will be displayed here.")
+        elif page == self.PAGES[4]:
+            st.title("Instructions")
+            st.markdown("""
+            ### How to Use This App
+            1. The map shows Nigeria's hydrological features
+            2. Use the layer control (top-right) to toggle different waterway types
+            3. Zoom in to see smaller streams
+            4. Watershed boundaries are shown as semi-transparent polygons
+            """)
+        elif page == self.PAGES[5]:
+            st.title("About")
+            st.markdown("""
+            ### Nigeria Flood Forecast System
+            
+            This application displays:
+            - **Watersheds**: HydroBASINS data (Level 6)
+            - **Waterways**: HOTOSM OpenStreetMap data with:
+              - Major rivers (thick dark blue)
+              - Rivers (medium blue)
+              - Streams (thin light blue)
+              - Canals (dashed)
+              - Drains (very thin)
+            
+            Data is loaded from Cloudflare R2 and cached locally.
+            """)
 
 
 # ===========================================================================
@@ -687,7 +718,7 @@ def main():
         page_title="Nigeria Flood Forecast",
         page_icon="🌊",
         layout="wide",
-        initial_sidebar_state="collapsed",
+        initial_sidebar_state="expanded",  # Changed from "collapsed" to "expanded"
     )
     app = FloodForecastWebApp()
     app.render()
