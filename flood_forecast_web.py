@@ -360,38 +360,70 @@ class FloodForecastWebApp:
         
         # Add Nigeria boundary
         if self.data_manager.boundary:
-            folium.GeoJson(
-                self.data_manager.boundary,
-                name="Nigeria Boundary",
-                style_function=lambda x: {"color": "#1B2631", "weight": 2, "fillOpacity": 0.1}
-            ).add_to(fmap)
+            try:
+                folium.GeoJson(
+                    self.data_manager.boundary,
+                    name="Nigeria Boundary",
+                    style_function=lambda x: {"color": "#1B2631", "weight": 2, "fillOpacity": 0.1}
+                ).add_to(fmap)
+            except Exception as e:
+                st.warning(f"Could not add boundary: {e}")
         
         # Add watersheds (from HydroBASINS or fallback)
         if self.data_manager.watersheds:
-            def style_watershed(feature):
-                props = feature.get('properties', {})
-                color = props.get('color', '#2C3E50')
-                return {
-                    'fillColor': color,
-                    'color': '#2C3E50',
-                    'weight': 1.3,
-                    'fillOpacity': 0.22
-                }
-            
-            folium.GeoJson(
-                self.data_manager.watersheds,
-                name="Watersheds",
-                style_function=style_watershed,
-                tooltip=folium.GeoJsonTooltip(fields=['name', 'id'], aliases=['Name:', 'ID:'])
-            ).add_to(fmap)
+            try:
+                # Check if this is fallback data (has 'id' and 'name' properties) or HydroBASINS (has 'HYBAS_ID')
+                sample_feature = self.data_manager.watersheds.get('features', [{}])[0]
+                props = sample_feature.get('properties', {})
+                
+                # Determine which fields are available
+                if 'HYBAS_ID' in props:
+                    # HydroBASINS data - use different tooltip fields
+                    folium.GeoJson(
+                        self.data_manager.watersheds,
+                        name="Watersheds",
+                        style_function=lambda x: {
+                            'fillColor': '#2C3E50',
+                            'color': '#2C3E50',
+                            'weight': 1.3,
+                            'fillOpacity': 0.22
+                        },
+                        tooltip=folium.GeoJsonTooltip(
+                            fields=['HYBAS_ID', 'SUB_AREA', 'UP_AREA'],
+                            aliases=['ID:', 'Area (km²):', 'Upstream Area (km²):'],
+                            localize=True
+                        )
+                    ).add_to(fmap)
+                else:
+                    # Fallback data - use id and name
+                    folium.GeoJson(
+                        self.data_manager.watersheds,
+                        name="Watersheds",
+                        style_function=lambda x: {
+                            'fillColor': x['properties'].get('color', '#2C3E50'),
+                            'color': '#2C3E50',
+                            'weight': 1.3,
+                            'fillOpacity': 0.22
+                        },
+                        tooltip=folium.GeoJsonTooltip(
+                            fields=['id', 'name'],
+                            aliases=['ID:', 'Name:'],
+                            localize=True
+                        )
+                    ).add_to(fmap)
+            except Exception as e:
+                st.warning(f"Could not add watersheds: {e}")
         
         # Add rivers (from Natural Earth)
         if self.data_manager.rivers:
-            folium.GeoJson(
-                self.data_manager.rivers,
-                name="Rivers",
-                style_function=lambda x: {"color": "#3498DB", "weight": 1.5, "opacity": 0.7}
-            ).add_to(fmap)
+            try:
+                folium.GeoJson(
+                    self.data_manager.rivers,
+                    name="Rivers",
+                    style_function=lambda x: {"color": "#3498DB", "weight": 1.5, "opacity": 0.7}
+                ).add_to(fmap)
+            except Exception as e:
+                st.warning(f"Could not add rivers: {e}")
         
         # Add legend
         legend_html = """
