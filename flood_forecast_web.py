@@ -200,59 +200,186 @@ FALLBACK_RIVERS: List[Dict[str, Any]] = [
 ]
 
 
-def _fetch_osm_rivers_nigeria(timeout: float = 120.0
-                              ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
-    """Fetch Nigerian rivers from the OpenStreetMap Overpass API.
+def _smooth_fallback_rivers(rivers: List[Dict[str, Any]]
+                            ) -> List[Dict[str, Any]]:
+    """Interpolate the hardcoded rivers into Catmull-Rom-ish curves.
 
-    Returns ``(rivers, status_message)`` where ``rivers`` is a list of
-    ``{"name": str, "coords": [(lon, lat), ...]}`` dicts, or ``None`` on
-    failure. No API key is required.
-
-    Strategy: query by ISO3166-1 area, try four different Overpass mirrors
-    so a single-endpoint outage doesn't kill the feature. Timeout is 120 s
-    because the waterway=river extract for Nigeria is ~3-5 MB.
+    The coarse 5-15 waypoints per river look like straight-segment zig-zags
+    at Nigeria-country zoom. A Catmull-Rom spline with ~10 subdivisions per
+    segment turns them into smooth meanders that visually resemble real
+    rivers, even though the underlying shape is still approximate. Used
+    only when OSM is unavailable.
     """
+    def catmull_rom(p0, p1, p2, p3, n=10):
+        out = []
+        for t in np.linspace(0, 1, n, endpoint=False):
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * ((2 * p1[0]) +
+                       (-p0[0] + p2[0]) * t +
+                       (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                       (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+            y = 0.5 * ((2 * p1[1]) +
+                       (-p0[1] + p2[1]) * t +
+                       (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                       (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+            out.append((x, y))
+        return out
+
+    smoothed: List[Dict[str, Any]] = []
+    for riv in rivers:
+        pts = [np.array(p, dtype=float) for p in riv["coords"]]
+        if len(pts) < 2:
+            continue
+        # Pad endpoints so Catmull-Rom has four control points per segment.
+        padded = [pts[0]] + pts + [pts[-1]]
+        curve: List[Tuple[float, float]] = []
+        for i in range(len(padded) - 3):
+            curve.extend(catmull_rom(padded[i], padded[i + 1],
+                                     padded[i + 2], padded[i + 3], n=12))
+        curve.append(tuple(pts[-1]))
+        smoothed.append({
+            "name": riv["name"],
+            "coords": [(float(x), float(y)) for x, y in curve],
+            "category": "river",
+            "waterway": "river",
+        })
+    return smoothed
+
+
+OVERPASS_ENDPOINTS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.osm.jp/api/interpreter",
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+]
+
+
+def _overpass_query(query: str, timeout: float = 180.0
+                    ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Submit an Overpass QL query, trying multiple mirrors in turn."""
     try:
         import requests
     except Exception:
         return None, "requests module unavailable"
+    last_err = "no endpoints tried"
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            resp = requests.post(
+                endpoint, data={"data": query}, timeout=timeout,
+                headers={"User-Agent": "FloodForecast/1.0 (contact: github)"},
+            )
+            resp.raise_for_status()
+            return resp.json(), f"via {endpoint}"
+        except Exception as exc:
+            last_err = f"{endpoint}: {exc}"
+            continue
+    return None, last_err
+
+
+def _parse_ways(payload: Dict[str, Any], category: str
+                ) -> List[Dict[str, Any]]:
+    """Convert Overpass way elements to ``{name, coords, category}`` dicts."""
+    out: List[Dict[str, Any]] = []
+    for elem in payload.get("elements", []):
+        if elem.get("type") != "way":
+            continue
+        geom = elem.get("geometry") or []
+        if len(geom) < 2:
+            continue
+        coords = [(float(p["lon"]), float(p["lat"])) for p in geom]
+        tags = elem.get("tags") or {}
+        name = tags.get("name") or category.title()
+        out.append({"name": name, "coords": coords, "category": category,
+                    "waterway": tags.get("waterway", "")})
+    return out
+
+
+def _parse_polygons(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Convert Overpass way elements to polygon features (lakes/reservoirs)."""
+    out: List[Dict[str, Any]] = []
+    for elem in payload.get("elements", []):
+        if elem.get("type") != "way":
+            continue
+        geom = elem.get("geometry") or []
+        if len(geom) < 4:
+            continue
+        # A closed way has first == last node.
+        if (geom[0].get("lon"), geom[0].get("lat")) != \
+                (geom[-1].get("lon"), geom[-1].get("lat")):
+            continue
+        coords = [(float(p["lon"]), float(p["lat"])) for p in geom]
+        tags = elem.get("tags") or {}
+        out.append({
+            "name": tags.get("name") or "Water body",
+            "coords": coords,
+            "water": tags.get("water", "water"),
+        })
+    return out
+
+
+def _fetch_osm_rivers_nigeria(timeout: float = 180.0
+                              ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Fetch Nigerian rivers + canals (main waterways) from Overpass.
+
+    Returns ``(features, status)`` where each feature is a
+    ``{name, coords, category, waterway}`` dict.
+    """
     query = (
-        '[out:json][timeout:90];'
+        '[out:json][timeout:150];'
         'area["ISO3166-1"="NG"][admin_level=2]->.ng;'
         '(way["waterway"="river"](area.ng);'
         ' way["waterway"="canal"](area.ng););'
         'out geom;'
     )
-    endpoints = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.openstreetmap.ru/api/interpreter",
-        "https://overpass.osm.jp/api/interpreter",
-    ]
-    last_err = "no endpoints tried"
-    for endpoint in endpoints:
-        try:
-            resp = requests.post(endpoint, data={"data": query},
-                                 timeout=timeout,
-                                 headers={"User-Agent": "FloodForecast/1.0"})
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception as exc:
-            last_err = f"{endpoint}: {exc}"
-            continue
-        rivers: List[Dict[str, Any]] = []
-        for elem in payload.get("elements", []):
-            if elem.get("type") != "way":
-                continue
-            geom = elem.get("geometry") or []
-            if len(geom) < 2:
-                continue
-            coords = [(float(p["lon"]), float(p["lat"])) for p in geom]
-            name = (elem.get("tags") or {}).get("name") or "River"
-            rivers.append({"name": name, "coords": coords})
-        if rivers:
-            return rivers, f"ok ({len(rivers)} ways via {endpoint})"
-    return None, last_err
+    payload, status = _overpass_query(query, timeout=timeout)
+    if payload is None:
+        return None, status
+    rivers = _parse_ways(payload, "river")
+    if not rivers:
+        return None, f"no ways returned ({status})"
+    return rivers, f"ok — {len(rivers)} rivers/canals {status}"
+
+
+def _fetch_osm_streams_nigeria(timeout: float = 240.0
+                               ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Fetch Nigerian streams (small waterways) from Overpass.
+
+    This is the big query — Nigeria has tens of thousands of streams.
+    Split off so a slow fetch here does not delay the main rivers fetch.
+    """
+    query = (
+        '[out:json][timeout:220];'
+        'area["ISO3166-1"="NG"][admin_level=2]->.ng;'
+        '(way["waterway"="stream"](area.ng);'
+        ' way["waterway"="drain"](area.ng););'
+        'out geom;'
+    )
+    payload, status = _overpass_query(query, timeout=timeout)
+    if payload is None:
+        return None, status
+    streams = _parse_ways(payload, "stream")
+    if not streams:
+        return [], f"0 streams returned ({status})"
+    return streams, f"ok — {len(streams)} streams {status}"
+
+
+def _fetch_osm_water_bodies_nigeria(timeout: float = 120.0
+                                    ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+    """Fetch Nigerian lakes/reservoirs (polygon water bodies) from Overpass."""
+    query = (
+        '[out:json][timeout:100];'
+        'area["ISO3166-1"="NG"][admin_level=2]->.ng;'
+        '(way["natural"="water"](area.ng);'
+        ' way["water"~"^(lake|reservoir|pond|lagoon)$"](area.ng););'
+        'out geom;'
+    )
+    payload, status = _overpass_query(query, timeout=timeout)
+    if payload is None:
+        return None, status
+    polys = _parse_polygons(payload)
+    return polys, f"ok — {len(polys)} water bodies {status}"
 
 
 def _fetch_nigeria_boundary(timeout: float = 30.0
@@ -817,52 +944,72 @@ class FloodForecastWebApp:
     # ------------------------------------------------------------------
     # Real Nigerian rivers (cached OSM fetch with hardcoded fallback)
     # ------------------------------------------------------------------
-    def _get_nigeria_rivers(self) -> List[Dict[str, Any]]:
-        """Return a list of ``{name, coords}`` river records for Nigeria.
-
-        Strategy (cache ordering):
-
-        1. In-session cache (``st.session_state.rivers``).
-        2. R2 cache (``cache/nigeria_rivers.json``) if R2 is configured.
-        3. OSM Overpass API — live fetch, then persist to R2 + session.
-        4. Hardcoded :data:`FALLBACK_RIVERS` so the map is never empty.
-        """
-        cached = st.session_state.get("rivers")
-        if cached:
+    # ------------------------------------------------------------------
+    # OSM waterways: rivers, streams, water bodies (all cached independently)
+    # ------------------------------------------------------------------
+    def _load_osm_cached(self, cache_key: str, fetch_fn,
+                         session_key: str, label: str,
+                         fallback: Any) -> Any:
+        """Session -> R2 -> live fetch -> hardcoded fallback cascade."""
+        cached = st.session_state.get(session_key)
+        if cached is not None:
             return cached
-        # R2 cache.
         if self._r2_enabled():
             try:
                 wd = self._workdir()
-                local = wd / "cache" / "nigeria_rivers.json"
-                if self.r2.download_file("cache/nigeria_rivers.json", local):
+                local = wd / "cache" / f"{cache_key}.json"
+                if self.r2.download_file(f"cache/{cache_key}.json", local):
                     data = json.loads(local.read_text(encoding="utf-8"))
                     if data:
-                        st.session_state.rivers = data
-                        self._log(f"Rivers: loaded {len(data)} from R2 cache.")
+                        st.session_state[session_key] = data
+                        self._log(f"{label}: loaded {len(data)} from R2 cache.")
                         return data
             except Exception as exc:
-                self._log(f"R2 river cache read failed: {exc}")
-        # Live OSM fetch.
-        osm, status = _fetch_osm_rivers_nigeria()
-        if osm:
-            st.session_state.rivers = osm
-            self._log(f"Rivers: fetched from OpenStreetMap — {status}")
-            if self._r2_enabled():
+                self._log(f"R2 {label} cache read failed: {exc}")
+        fresh, status = fetch_fn()
+        if fresh is not None:
+            st.session_state[session_key] = fresh
+            self._log(f"{label}: {status}")
+            if self._r2_enabled() and fresh:
                 try:
                     self.r2.upload_bytes(
-                        json.dumps(osm).encode("utf-8"),
-                        "cache/nigeria_rivers.json",
+                        json.dumps(fresh).encode("utf-8"),
+                        f"cache/{cache_key}.json",
                         content_type="application/json",
                     )
                 except Exception as exc:
-                    self._log(f"R2 river cache write failed: {exc}")
-            return osm
-        # Last resort: hardcoded.
-        self._log(f"Rivers: OSM fetch failed ({status}); "
-                  f"using hardcoded fallback of {len(FALLBACK_RIVERS)} rivers.")
-        st.session_state.rivers = FALLBACK_RIVERS
-        return FALLBACK_RIVERS
+                    self._log(f"R2 {label} cache write failed: {exc}")
+            return fresh
+        self._log(f"{label}: fetch failed ({status}); using fallback.")
+        st.session_state[session_key] = fallback
+        return fallback
+
+    def _get_nigeria_rivers(self) -> List[Dict[str, Any]]:
+        """Major rivers + canals. Hardcoded curved fallback on failure."""
+        return self._load_osm_cached(
+            "nigeria_rivers", _fetch_osm_rivers_nigeria,
+            "rivers", "Rivers", _smooth_fallback_rivers(FALLBACK_RIVERS),
+        )
+
+    def _get_nigeria_streams(self) -> List[Dict[str, Any]]:
+        """Smaller streams + drains. Empty list on failure (optional layer)."""
+        return self._load_osm_cached(
+            "nigeria_streams", _fetch_osm_streams_nigeria,
+            "streams", "Streams", [],
+        )
+
+    def _get_nigeria_water_bodies(self) -> List[Dict[str, Any]]:
+        """Lakes/reservoirs (polygons). Empty list on failure."""
+        return self._load_osm_cached(
+            "nigeria_water_bodies", _fetch_osm_water_bodies_nigeria,
+            "water_bodies", "Water bodies", [],
+        )
+
+    def _refresh_osm_data(self) -> None:
+        """Wipe OSM caches so the next render triggers a fresh fetch."""
+        for k in ("rivers", "streams", "water_bodies"):
+            st.session_state.pop(k, None)
+        self._log("OSM caches cleared — next render will re-fetch.")
 
     def _get_nigeria_boundary(self) -> List[Tuple[float, float]]:
         """Return Nigeria's outer boundary as a list of (lon, lat) vertices.
@@ -1007,15 +1154,50 @@ class FloodForecastWebApp:
             ).add_to(fg_b)
         fg_b.add_to(fmap)
 
-        # --- Real Nigerian river network, coloured by alert ---
+        # --- Lakes & reservoirs (polygons, drawn under rivers) ---
+        water_bodies = self._get_nigeria_water_bodies()
+        if water_bodies:
+            fg_w = folium.FeatureGroup(name="Lakes & reservoirs", show=True)
+            for wb in water_bodies:
+                coords = wb.get("coords") or []
+                inside = [(lon, lat) for lon, lat in coords
+                          if lon_min <= lon <= lon_max
+                          and lat_min <= lat <= lat_max]
+                if len(inside) < 4:
+                    continue
+                folium.Polygon(
+                    [(lat, lon) for lon, lat in inside],
+                    color="#1F618D", weight=0.8, opacity=0.9,
+                    fill=True, fill_color="#5DADE2", fill_opacity=0.55,
+                    tooltip=wb.get("name") or "Water body",
+                ).add_to(fg_w)
+            fg_w.add_to(fmap)
+
+        # --- Streams (small waterways, drawn thin) ---
+        streams = self._get_nigeria_streams()
+        if streams:
+            fg_s = folium.FeatureGroup(name="Streams", show=True)
+            for st_ in streams:
+                coords_lonlat = st_.get("coords") or []
+                inside = [(lon, lat) for lon, lat in coords_lonlat
+                          if lon_min <= lon <= lon_max
+                          and lat_min <= lat <= lat_max]
+                if len(inside) < 2:
+                    continue
+                folium.PolyLine(
+                    [(lat, lon) for lon, lat in inside],
+                    color="#5DADE2", weight=0.8, opacity=0.55,
+                ).add_to(fg_s)
+            fg_s.add_to(fmap)
+
+        # --- Major rivers + canals, coloured by alert ---
         rivers = self._get_nigeria_rivers()
         alert_by_river = self._river_alert_levels(recs)
-        fg_r = folium.FeatureGroup(name="Rivers", show=True)
+        fg_r = folium.FeatureGroup(name="Rivers & canals", show=True)
         for riv in rivers:
             coords_lonlat = riv.get("coords") or []
             if len(coords_lonlat) < 2:
                 continue
-            # Clip each river to the Nigeria bbox (drop vertices outside).
             inside = [(lon, lat) for lon, lat in coords_lonlat
                       if lon_min <= lon <= lon_max
                       and lat_min <= lat <= lat_max]
@@ -1023,6 +1205,7 @@ class FloodForecastWebApp:
                 continue
             path_latlon = [(lat, lon) for lon, lat in inside]
             name = (riv.get("name") or "").strip()
+            waterway = (riv.get("waterway") or "river").lower()
             level = alert_by_river.get(name.lower(), None)
             if level == "RED":
                 color, weight, opacity = "#C0392B", 4.0, 0.95
@@ -1031,14 +1214,14 @@ class FloodForecastWebApp:
             elif level == "GREEN":
                 color, weight, opacity = "#27AE60", 2.8, 0.85
             else:
-                # No gauge on this river -> baseline blue.
-                color, weight, opacity = "#1F618D", 1.8, 0.75
-            tooltip = f"{name or 'River'}"
+                color, weight, opacity = "#1F618D", 1.9, 0.80
+            dash = "4,6" if waterway == "canal" else None
+            tooltip = f"{name or 'River'}" + (f" ({waterway})" if waterway else "")
             if level:
                 tooltip += f" — {level}"
             folium.PolyLine(
                 path_latlon, color=color, weight=weight, opacity=opacity,
-                tooltip=tooltip,
+                dash_array=dash, tooltip=tooltip,
             ).add_to(fg_r)
         fg_r.add_to(fmap)
 
@@ -1508,6 +1691,22 @@ overrides the forecast horizon, and renders the outputs.
                 "to enable persistence. Required keys: `endpoint_url`, "
                 "`access_key`, `secret_key`, `bucket_name`."
             )
+
+        st.markdown("### OpenStreetMap data")
+        n_riv = len(st.session_state.get("rivers") or [])
+        n_str = len(st.session_state.get("streams") or [])
+        n_wat = len(st.session_state.get("water_bodies") or [])
+        st.markdown(
+            f"- Rivers & canals loaded: **{n_riv}**\n"
+            f"- Streams loaded: **{n_str}**\n"
+            f"- Lakes/reservoirs loaded: **{n_wat}**"
+        )
+        if st.button("🔄 Refresh waterway data from OpenStreetMap",
+                     key="refresh_osm_btn",
+                     help="Clears the cache and re-fetches rivers, streams "
+                          "and water bodies from OSM. Takes 30-180 s."):
+            self._refresh_osm_data()
+            st.rerun()
 
         st.markdown("### Run log")
         if st.session_state.run_log:
