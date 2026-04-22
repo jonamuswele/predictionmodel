@@ -99,8 +99,12 @@ class FloodForecastWebApp:
     def _workdir(self) -> Path:
         if st.session_state.workdir is None:
             tmp = Path(tempfile.mkdtemp(prefix="flood_web_"))
-            for sub in ("data/gauges", "data/dem", "data/met",
-                        "data/chirps", "outputs"):
+            # NOTE: do NOT create data/chirps. The pipeline's
+            # get_basin_mean_precip() falls back to a synthetic gamma-rain
+            # series only when the chirps path does not exist; if we create
+            # an empty directory, rasterio.open() is called on that directory
+            # and raises RasterioIOError. Leaving it absent is the fix.
+            for sub in ("data/gauges", "data/dem", "data/met", "outputs"):
                 (tmp / sub).mkdir(parents=True, exist_ok=True)
             st.session_state.workdir = str(tmp)
         return Path(st.session_state.workdir)
