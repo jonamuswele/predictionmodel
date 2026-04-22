@@ -73,86 +73,42 @@ class ProfessionalDataManager:
         """Download all hydrological files from R2."""
         try:
             # List all files in R2 to debug
-            st.info("Checking files in R2 bucket...")
-            
-            # Use list_files with empty string to get all files
-            all_files = self.r2.list_files("")
-            st.write(f"Files found in R2: {all_files}")
+            st.info("🔍 Checking files in R2 bucket...")
+            all_files = self.r2.list_files("geojson/")
+            st.write(f"Files found in geojson/: {all_files}")
             
             # 1. Download HydroBASINS watersheds
-            hydrobasins_remote = None
-            # Check all possible paths
-            possible_hydro_paths = [
-                "hybas_af_lev06_v1c.zip",
-                "geojson/hybas_af_lev06_v1c.zip",
-                "/hybas_af_lev06_v1c.zip",
-                "/geojson/hybas_af_lev06_v1c.zip"
-            ]
-            
-            for path in possible_hydro_paths:
-                if self.r2.exists(path):
-                    hydrobasins_remote = path
-                    st.write(f"Found HydroBASINS at: {path}")
-                    break
-            
-            if hydrobasins_remote:
-                st.info("Downloading HydroBASINS watershed data (523 MB - please wait)...")
+            hydrobasins_remote = "geojson/hybas_af_lev06_v1c.zip"
+            if self.r2.exists(hydrobasins_remote):
+                st.info("📥 Downloading HydroBASINS watershed data (549 MB - please wait)...")
                 zip_path = self.data_dir / "hybas_af_lev06_v1c.zip"
                 
                 if self.r2.download_file(hydrobasins_remote, zip_path):
-                    # Extract the zip file
-                    with zipfile.ZipFile(zip_path, 'r') as z:
-                        z.extractall(self.data_dir)
-                    st.success("✓ HydroBASINS downloaded and extracted")
+                    st.success("✓ HydroBASINS downloaded")
                 else:
                     st.warning("Could not download HydroBASINS, will use fallback")
             else:
-                st.warning("HydroBASINS file not found in R2 bucket")
+                st.warning(f"HydroBASINS file not found at {hydrobasins_remote}")
             
-            # 2. Download Nigeria boundary
-            boundary_remote = None
-            possible_boundary_paths = [
-                "nigeria_boundary.geojson",
-                "geojson/nigeria_boundary.geojson",
-                "/nigeria_boundary.geojson",
-                "/geojson/nigeria_boundary.geojson"
-            ]
+            # 2. Download rivers
+            rivers_remote = "geojson/ne_10m_rivers.zip"
+            if self.r2.exists(rivers_remote):
+                st.info("📥 Downloading river network data (2 MB)...")
+                rivers_zip = self.data_dir / "ne_10m_rivers.zip"
+                if self.r2.download_file(rivers_remote, rivers_zip):
+                    st.success("✓ River network downloaded")
+            else:
+                st.warning(f"Rivers file not found at {rivers_remote}")
             
-            for path in possible_boundary_paths:
-                if self.r2.exists(path):
-                    boundary_remote = path
-                    st.write(f"Found boundary at: {path}")
-                    break
-            
-            if boundary_remote:
+            # 3. Download Nigeria boundary
+            boundary_remote = "geojson/nigeria_boundary.geojson"
+            if self.r2.exists(boundary_remote):
+                st.info("📥 Downloading Nigeria boundary...")
                 boundary_path = self.data_dir / "nigeria_boundary.geojson"
                 if self.r2.download_file(boundary_remote, boundary_path):
                     st.success("✓ Nigeria boundary downloaded")
-            
-            # 3. Download rivers (Natural Earth)
-            rivers_remote = None
-            possible_river_paths = [
-                "ne_10m_rivers.zip",
-                "ne_10m_rivers_lake_centerlines.zip",
-                "geojson/ne_10m_rivers.zip",
-                "geojson/ne_10m_rivers_lake_centerlines.zip",
-                "/ne_10m_rivers.zip",
-                "/geojson/ne_10m_rivers.zip"
-            ]
-            
-            for path in possible_river_paths:
-                if self.r2.exists(path):
-                    rivers_remote = path
-                    st.write(f"Found rivers at: {path}")
-                    break
-            
-            if rivers_remote:
-                st.info("Downloading river network data...")
-                rivers_zip = self.data_dir / "ne_10m_rivers_lake_centerlines.zip"
-                if self.r2.download_file(rivers_remote, rivers_zip):
-                    with zipfile.ZipFile(rivers_zip, 'r') as z:
-                        z.extractall(self.data_dir)
-                    st.success("✓ River network downloaded")
+            else:
+                st.warning(f"Boundary file not found at {boundary_remote}")
             
             return True
             
@@ -169,28 +125,58 @@ class ProfessionalDataManager:
             from shapely.geometry import box
             
             # First, check what files we have locally
-            st.write("Local files in data_dir:", list(self.data_dir.glob("*")))
+            st.write("📁 Local files in data_dir:", list(self.data_dir.glob("*")))
+            st.write("📁 Subdirectories:", list(self.data_dir.glob("*/")))
             
+            # ============================================================
             # Load watersheds from HydroBASINS
-            shp_path = self.data_dir / "hybas_af_lev06_v1c.shp"
-            if not shp_path.exists():
-                # Try looking in subdirectories
-                for subdir in self.data_dir.glob("*/"):
-                    potential_shp = subdir / "hybas_af_lev06_v1c.shp"
-                    if potential_shp.exists():
-                        shp_path = potential_shp
-                        break
+            # ============================================================
+            shp_path = None
             
-            if shp_path.exists():
-                st.info("Loading watershed boundaries...")
+            # Check if hybas_af_lev06_v1c.zip exists and extract if needed
+            hydro_zip = self.data_dir / "hybas_af_lev06_v1c.zip"
+            if hydro_zip.exists():
+                st.info("📦 hybas_af_lev06_v1c.zip found, checking if extracted...")
+                
+                # Look for any .shp file in the data directory
+                all_shp_files = list(self.data_dir.glob("**/*.shp"))
+                st.write(f"Found shapefiles: {[str(f) for f in all_shp_files]}")
+                
+                if not all_shp_files:
+                    # Need to extract
+                    st.info("Extracting hybas_af_lev06_v1c.zip...")
+                    with zipfile.ZipFile(hydro_zip, 'r') as z:
+                        z.extractall(self.data_dir)
+                        st.write(f"Extracted files: {z.namelist()[:15]}")
+                    
+                    # Look again after extraction
+                    all_shp_files = list(self.data_dir.glob("**/*.shp"))
+                    st.write(f"Shapefiles after extraction: {[str(f) for f in all_shp_files]}")
+                
+                # Find the shapefile (might be hybas_af_lev06_v1c.shp or similar)
+                for shp in all_shp_files:
+                    if "hybas" in str(shp).lower() or "lev06" in str(shp).lower():
+                        shp_path = shp
+                        st.write(f"✅ Found watershed shapefile: {shp_path}")
+                        break
+                
+                # If still not found, take any shapefile
+                if not shp_path and all_shp_files:
+                    shp_path = all_shp_files[0]
+                    st.write(f"⚠️ Using first shapefile found: {shp_path}")
+            
+            if shp_path and shp_path.exists():
+                st.info("🗺️ Loading watershed boundaries...")
                 basins = gpd.read_file(shp_path)
                 st.write(f"Loaded basins shapefile with {len(basins)} features")
+                st.write(f"Columns: {basins.columns.tolist()}")
                 
                 # Get Nigeria boundary
                 nigeria = self._get_nigeria_boundary_gdf()
                 
                 # Clip to Nigeria
                 nigeria_basins = gpd.clip(basins, nigeria)
+                st.write(f"After clipping to Nigeria: {len(nigeria_basins)} basins")
                 
                 # Convert to GeoJSON
                 self.watersheds = json.loads(nigeria_basins.to_json())
@@ -201,21 +187,44 @@ class ProfessionalDataManager:
                 }
                 st.success(f"✅ Loaded {len(nigeria_basins)} watershed basins")
             else:
-                st.warning(f"Shapefile not found at {shp_path}")
+                st.warning(f"No HydroBASINS shapefile found at {shp_path}")
             
+            # ============================================================
             # Load rivers
-            rivers_shp = self.data_dir / "ne_10m_rivers_lake_centerlines.shp"
-            if not rivers_shp.exists():
-                rivers_shp = self.data_dir / "ne_10m_rivers.shp"
+            # ============================================================
+            rivers_shp = None
             
-            if rivers_shp.exists():
-                st.info("Loading river network...")
+            # Check if ne_10m_rivers.zip exists
+            rivers_zip = self.data_dir / "ne_10m_rivers.zip"
+            if rivers_zip.exists():
+                st.info("📦 ne_10m_rivers.zip found, checking if extracted...")
+                
+                all_shp_files = list(self.data_dir.glob("**/*.shp"))
+                
+                if not all_shp_files:
+                    st.info("Extracting ne_10m_rivers.zip...")
+                    with zipfile.ZipFile(rivers_zip, 'r') as z:
+                        z.extractall(self.data_dir)
+                        st.write(f"Extracted files: {z.namelist()[:15]}")
+                    
+                    all_shp_files = list(self.data_dir.glob("**/*.shp"))
+                
+                # Look for river shapefile
+                for shp in all_shp_files:
+                    if "river" in str(shp).lower() or "ne_10m" in str(shp).lower():
+                        rivers_shp = shp
+                        st.write(f"✅ Found river shapefile: {rivers_shp}")
+                        break
+            
+            if rivers_shp and rivers_shp.exists():
+                st.info("🌊 Loading river network...")
                 rivers = gpd.read_file(rivers_shp)
                 st.write(f"Loaded rivers shapefile with {len(rivers)} features")
                 
                 # Filter to Nigeria
                 nigeria = self._get_nigeria_boundary_gdf()
                 nigeria_rivers = rivers[rivers.within(nigeria.unary_union.buffer(0.5))]
+                st.write(f"After filtering to Nigeria: {len(nigeria_rivers)} rivers")
                 
                 self.rivers = json.loads(nigeria_rivers.to_json())
                 self.rivers['metadata'] = {
@@ -224,15 +233,26 @@ class ProfessionalDataManager:
                 }
                 st.success(f"✅ Loaded {len(nigeria_rivers)} river segments")
             
+            # ============================================================
             # Load boundary
+            # ============================================================
             boundary_path = self.data_dir / "nigeria_boundary.geojson"
             if boundary_path.exists():
                 with open(boundary_path, 'r') as f:
                     self.boundary = json.load(f)
                 st.success("✅ Loaded Nigeria boundary")
+            else:
+                st.warning("Boundary file not found, downloading from R2...")
+                # Try to download from R2 if not present
+                if self.r2 and self.r2.exists("geojson/nigeria_boundary.geojson"):
+                    if self.r2.download_file("geojson/nigeria_boundary.geojson", boundary_path):
+                        with open(boundary_path, 'r') as f:
+                            self.boundary = json.load(f)
+                        st.success("✅ Downloaded and loaded Nigeria boundary")
             
             # If any data is missing, create fallback
             if self.watersheds is None:
+                st.warning("No watershed data found, using fallback")
                 self._create_fallback_watersheds()
             
             return True
