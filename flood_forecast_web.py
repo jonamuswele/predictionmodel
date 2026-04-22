@@ -69,6 +69,111 @@ def _try_import_rasterio_features():
         return None
 
 
+# ---------------------------------------------------------------------------
+# Nigeria geography (static fallbacks; OSM Overpass supersedes at runtime)
+# ---------------------------------------------------------------------------
+# (lon_min, lat_min, lon_max, lat_max)
+NIGERIA_BBOX: Tuple[float, float, float, float] = (2.65, 4.20, 14.70, 13.90)
+
+# Simplified Nigeria country boundary (~35 vertices). Good enough for a
+# visual clip; not cartographically precise. CC0 approximation.
+NIGERIA_BOUNDARY: List[Tuple[float, float]] = [
+    (3.62, 13.75), (4.30, 13.80), (5.50, 13.85), (6.40, 13.60),
+    (7.40, 13.70), (8.50, 13.20), (10.00, 13.00), (11.30, 13.40),
+    (12.30, 13.10), (13.30, 13.60), (14.00, 13.10), (14.50, 12.90),
+    (14.20, 12.40), (14.60, 12.00), (14.20, 11.50), (14.10, 10.50),
+    (13.80, 10.00), (13.20, 9.60), (12.60, 9.00), (12.80, 8.50),
+    (13.00, 7.80), (12.60, 7.40), (12.20, 7.00), (11.80, 6.60),
+    (11.40, 6.50), (10.60, 7.00), (10.10, 6.90), (9.50, 6.80),
+    (9.00, 6.50), (8.70, 5.60), (8.50, 4.80), (8.30, 4.55),
+    (7.90, 4.30), (7.00, 4.40), (6.20, 4.30), (5.40, 5.50),
+    (4.70, 6.10), (4.00, 6.10), (3.30, 6.30), (2.75, 6.37),
+    (2.70, 6.80), (2.80, 7.80), (2.75, 8.60), (3.00, 9.10),
+    (3.50, 9.90), (3.60, 10.70), (3.70, 11.40), (3.60, 12.30),
+    (3.90, 12.80), (4.00, 13.30), (3.80, 13.70), (3.62, 13.75),
+]
+
+# Fallback rivers — approximate centerlines for 10 major Nigerian rivers.
+# Coordinates are (lon, lat) ordered upstream -> downstream. These are used
+# only if the OSM Overpass fetch fails (offline / rate-limited).
+FALLBACK_RIVERS: List[Dict[str, Any]] = [
+    {"name": "Niger", "coords": [
+        (3.60, 11.90), (3.85, 11.55), (4.20, 11.10), (4.55, 10.55),
+        (4.90, 10.00), (5.30, 9.50), (5.75, 9.10), (6.25, 8.45),
+        (6.75, 7.80), (6.90, 7.20), (6.60, 6.60), (6.40, 5.95),
+        (6.35, 5.35), (6.40, 4.80), (6.60, 4.50)]},
+    {"name": "Benue", "coords": [
+        (13.50, 7.90), (13.00, 8.40), (12.50, 9.20), (11.50, 8.80),
+        (10.50, 8.40), (9.50, 8.10), (8.50, 7.75), (7.55, 7.75),
+        (6.90, 7.80)]},
+    {"name": "Kaduna", "coords": [
+        (9.50, 9.80), (8.70, 10.15), (7.95, 10.45), (7.40, 10.50),
+        (6.80, 10.10), (6.20, 9.60), (5.90, 9.10)]},
+    {"name": "Sokoto", "coords": [
+        (5.25, 13.05), (4.90, 12.60), (4.60, 12.20), (4.40, 11.85),
+        (4.20, 11.60), (3.85, 11.55)]},
+    {"name": "Gongola", "coords": [
+        (10.60, 10.80), (10.90, 10.40), (11.10, 9.90), (11.30, 9.40),
+        (11.50, 9.00), (11.50, 8.80)]},
+    {"name": "Komadugu Yobe", "coords": [
+        (11.00, 12.00), (11.60, 12.20), (12.20, 12.50), (12.80, 12.80),
+        (13.20, 13.00), (13.40, 13.10)]},
+    {"name": "Cross", "coords": [
+        (9.10, 6.10), (8.80, 5.80), (8.55, 5.40), (8.30, 4.90),
+        (8.25, 4.75)]},
+    {"name": "Ogun", "coords": [
+        (3.40, 8.50), (3.35, 8.00), (3.30, 7.40), (3.30, 6.90),
+        (3.35, 6.55), (3.40, 6.40)]},
+    {"name": "Osun", "coords": [
+        (4.55, 7.80), (4.45, 7.40), (4.35, 7.00), (4.30, 6.60),
+        (4.20, 6.30)]},
+    {"name": "Anambra", "coords": [
+        (7.20, 6.90), (7.00, 6.60), (6.85, 6.35), (6.75, 6.10)]},
+]
+
+
+def _fetch_osm_rivers_nigeria(timeout: float = 40.0
+                              ) -> Optional[List[Dict[str, Any]]]:
+    """Fetch Nigerian rivers from the OpenStreetMap Overpass API.
+
+    Returns a list of ``{"name": str, "coords": [(lon, lat), ...]}`` dicts,
+    or ``None`` on failure. No API key is required. Rate-limited by
+    Overpass to ~2 requests per second per IP; this function is intended
+    to be called at most once per container boot and its result cached.
+    """
+    try:
+        import requests
+    except Exception:
+        return None
+    query = (
+        '[out:json][timeout:40];'
+        'area["ISO3166-1"="NG"][admin_level=2]->.ng;'
+        '(way["waterway"="river"](area.ng););'
+        'out geom;'
+    )
+    for endpoint in ("https://overpass-api.de/api/interpreter",
+                     "https://overpass.kumi.systems/api/interpreter"):
+        try:
+            resp = requests.post(endpoint, data={"data": query}, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            continue
+        rivers: List[Dict[str, Any]] = []
+        for elem in payload.get("elements", []):
+            if elem.get("type") != "way":
+                continue
+            geom = elem.get("geometry") or []
+            if len(geom) < 2:
+                continue
+            coords = [(float(p["lon"]), float(p["lat"])) for p in geom]
+            name = (elem.get("tags") or {}).get("name") or "River"
+            rivers.append({"name": name, "coords": coords})
+        if rivers:
+            return rivers
+    return None
+
+
 # ===========================================================================
 #                          FloodForecastWebApp
 # ===========================================================================
@@ -587,45 +692,94 @@ class FloodForecastWebApp:
         except Exception:
             return None
 
-    def _river_polylines(self, system: ffn.FloodForecastSystem) -> List[List[Tuple[float, float]]]:
-        ws = getattr(system, "watershed_data", None)
-        if not ws:
-            return []
-        rn = ws.get("river_network")
-        if rn is None:
-            return []
-        lines: List[List[Tuple[float, float]]] = []
-        try:
-            if hasattr(rn, "geometry"):
-                for geom in rn.geometry:
-                    if geom is None:
-                        continue
-                    if geom.geom_type == "LineString":
-                        lines.append([(y, x) for x, y in geom.coords])
-                    elif geom.geom_type == "MultiLineString":
-                        for part in geom.geoms:
-                            lines.append([(y, x) for x, y in part.coords])
-            elif isinstance(rn, list):
-                for seg in rn:
-                    if not seg:
-                        continue
-                    lines.append([(lat, lon) for lat, lon in seg])
-        except Exception:
-            pass
-        return lines
+    # ------------------------------------------------------------------
+    # Real Nigerian rivers (cached OSM fetch with hardcoded fallback)
+    # ------------------------------------------------------------------
+    def _get_nigeria_rivers(self) -> List[Dict[str, Any]]:
+        """Return a list of ``{name, coords}`` river records for Nigeria.
+
+        Strategy (cache ordering):
+
+        1. In-session cache (``st.session_state.rivers``).
+        2. R2 cache (``cache/nigeria_rivers.json``) if R2 is configured.
+        3. OSM Overpass API — live fetch, then persist to R2 + session.
+        4. Hardcoded :data:`FALLBACK_RIVERS` so the map is never empty.
+        """
+        cached = st.session_state.get("rivers")
+        if cached:
+            return cached
+        # R2 cache.
+        if self._r2_enabled():
+            try:
+                wd = self._workdir()
+                local = wd / "cache" / "nigeria_rivers.json"
+                if self.r2.download_file("cache/nigeria_rivers.json", local):
+                    data = json.loads(local.read_text(encoding="utf-8"))
+                    if data:
+                        st.session_state.rivers = data
+                        self._log(f"Rivers: loaded {len(data)} from R2 cache.")
+                        return data
+            except Exception as exc:
+                self._log(f"R2 river cache read failed: {exc}")
+        # Live OSM fetch.
+        osm = _fetch_osm_rivers_nigeria()
+        if osm:
+            st.session_state.rivers = osm
+            self._log(f"Rivers: fetched {len(osm)} from OpenStreetMap.")
+            if self._r2_enabled():
+                try:
+                    self.r2.upload_bytes(
+                        json.dumps(osm).encode("utf-8"),
+                        "cache/nigeria_rivers.json",
+                        content_type="application/json",
+                    )
+                except Exception as exc:
+                    self._log(f"R2 river cache write failed: {exc}")
+            return osm
+        # Last resort: hardcoded.
+        self._log("Rivers: using hardcoded fallback (10 major rivers).")
+        st.session_state.rivers = FALLBACK_RIVERS
+        return FALLBACK_RIVERS
+
+    def _river_alert_levels(self, recs: List[Dict[str, Any]]
+                            ) -> Dict[str, str]:
+        """Map lower-cased river name -> worst alert level across its gauges."""
+        rank = {"GREEN": 0, "AMBER": 1, "RED": 2}
+        worst: Dict[str, str] = {}
+        for r in recs:
+            river = (r.get("river") or "").strip().lower()
+            if not river:
+                continue
+            level = r.get("alert_level", "GREEN")
+            if river not in worst or rank[level] > rank[worst[river]]:
+                worst[river] = level
+        return worst
 
     def _station_records(self, system: ffn.FloodForecastSystem,
                          report: Optional[Dict[str, Dict[str, Any]]]):
+        """Return station records for the map.
+
+        Only returns records when the user has actually uploaded gauge data.
+        In demo mode the map shows rivers and watersheds but no gauges, so
+        the alert layer stays off until real data is supplied. Any gauge
+        outside the Nigeria bounding box is dropped.
+        """
+        if st.session_state.get("is_demo", True):
+            return []
         dm = getattr(system, "data_manager", None)
         if dm is None:
             return []
         gdf = dm.get_station_geodataframe()
+        lon_min, lat_min, lon_max, lat_max = NIGERIA_BBOX
         recs = []
         for _, row in gdf.iterrows():
             sid = row.get("station_id")
             lat = float(row.get("latitude", np.nan))
             lon = float(row.get("longitude", np.nan))
             if not (np.isfinite(lat) and np.isfinite(lon)):
+                continue
+            if not (lon_min <= lon <= lon_max and lat_min <= lat <= lat_max):
+                # Gauge is outside Nigeria — skip (and only skip, do not alert).
                 continue
             alert = (report or {}).get(sid, {})
             recs.append({
@@ -647,44 +801,90 @@ class FloodForecastWebApp:
         if folium is None:
             return None
 
-        # Center on the centroid of stations, or Nigeria as fallback.
         recs = self._station_records(system, report)
-        if recs:
-            lat0 = float(np.mean([r["lat"] for r in recs]))
-            lon0 = float(np.mean([r["lon"] for r in recs]))
-        else:
-            lat0, lon0 = 9.1, 8.7
+        # Lock the map viewport to Nigeria so nothing outside the country is
+        # ever the primary view.
+        lon_min, lat_min, lon_max, lat_max = NIGERIA_BBOX
+        fmap = folium.Map(
+            location=[(lat_min + lat_max) / 2, (lon_min + lon_max) / 2],
+            zoom_start=6, tiles="CartoDB positron", control_scale=True,
+            min_lat=lat_min - 1, max_lat=lat_max + 1,
+            min_lon=lon_min - 1, max_lon=lon_max + 1,
+        )
+        fmap.fit_bounds([[lat_min, lon_min], [lat_max, lon_max]])
 
-        fmap = folium.Map(location=[lat0, lon0], zoom_start=6,
-                          tiles="CartoDB positron", control_scale=True)
+        # --- Nigeria national boundary (always drawn first) ---
+        fg_bnd = folium.FeatureGroup(name="Nigeria boundary", show=True)
+        folium.PolyLine(
+            [(lat, lon) for lon, lat in NIGERIA_BOUNDARY],
+            color="#1B2631", weight=2.0, opacity=0.7, dash_array="6,4",
+        ).add_to(fg_bnd)
+        fg_bnd.add_to(fmap)
 
-        # --- Watershed polygons ---
+        # --- Watershed polygons, clipped to Nigeria bbox ---
         basin_feats = self._basins_to_geojson(system)
         if basin_feats:
             fg_b = folium.FeatureGroup(name="Watersheds", show=True)
             palette = ["#5DADE2", "#48C9B0", "#F5B041", "#AF7AC5",
                        "#EC7063", "#58D68D", "#F4D03F", "#5D6D7E"]
             for feat in basin_feats:
+                geom = feat.get("geometry") or {}
+                # Skip any basin whose first coordinate is outside Nigeria.
+                coords = geom.get("coordinates") or []
+                first = None
+                if coords and isinstance(coords[0], list) and coords[0]:
+                    first = coords[0][0] if isinstance(coords[0][0], list) else None
+                if first and len(first) >= 2:
+                    lon, lat = float(first[0]), float(first[1])
+                    if not (lon_min <= lon <= lon_max
+                            and lat_min <= lat <= lat_max):
+                        continue
                 bid = int(feat["properties"]["basin_id"])
                 color = palette[bid % len(palette)]
                 folium.GeoJson(
                     feat,
                     style_function=lambda _x, c=color: {
                         "fillColor": c, "color": "#2C3E50",
-                        "weight": 1.0, "fillOpacity": 0.28,
+                        "weight": 1.0, "fillOpacity": 0.25,
                     },
-                    tooltip=f"Basin {bid}",
+                    tooltip=f"Watershed {bid}",
                 ).add_to(fg_b)
             fg_b.add_to(fmap)
 
-        # --- River network ---
-        lines = self._river_polylines(system)
-        if lines:
-            fg_r = folium.FeatureGroup(name="River network", show=True)
-            for line in lines:
-                folium.PolyLine(line, color="#1F618D", weight=2.2,
-                                opacity=0.85).add_to(fg_r)
-            fg_r.add_to(fmap)
+        # --- Real Nigerian river network, coloured by alert ---
+        rivers = self._get_nigeria_rivers()
+        alert_by_river = self._river_alert_levels(recs)
+        fg_r = folium.FeatureGroup(name="Rivers", show=True)
+        for riv in rivers:
+            coords_lonlat = riv.get("coords") or []
+            if len(coords_lonlat) < 2:
+                continue
+            # Clip each river to the Nigeria bbox (drop vertices outside).
+            inside = [(lon, lat) for lon, lat in coords_lonlat
+                      if lon_min <= lon <= lon_max
+                      and lat_min <= lat <= lat_max]
+            if len(inside) < 2:
+                continue
+            path_latlon = [(lat, lon) for lon, lat in inside]
+            name = (riv.get("name") or "").strip()
+            level = alert_by_river.get(name.lower(), None)
+            if level == "RED":
+                color, weight, opacity = "#C0392B", 4.0, 0.95
+            elif level == "AMBER":
+                color, weight, opacity = "#F39C12", 3.2, 0.90
+            elif level == "GREEN":
+                color, weight, opacity = "#27AE60", 2.8, 0.85
+            else:
+                # No gauge on this river -> baseline blue.
+                color, weight, opacity = "#1F618D", 1.8, 0.75
+            tooltip = f"{name or 'River'}"
+            if level:
+                tooltip += f" — {level}"
+            folium.PolyLine(
+                path_latlon, color=color, weight=weight, opacity=opacity,
+                tooltip=tooltip,
+            ).add_to(fg_r)
+        fg_r.add_to(fmap)
 
         # --- Flood extent overlay (RiverREM based HAND) ---
         try:
@@ -753,12 +953,21 @@ class FloodForecastWebApp:
                         background: white; padding: 10px 14px; border-radius: 6px;
                         box-shadow: 0 1px 4px rgba(0,0,0,0.25); font: 12px/1.4 sans-serif;">
               <b>Legend</b><br>
-              <span style='display:inline-block;width:12px;height:12px;background:#C0392B;border-radius:50%;'></span> RED alert<br>
-              <span style='display:inline-block;width:12px;height:12px;background:#F39C12;border-radius:50%;'></span> AMBER alert<br>
-              <span style='display:inline-block;width:12px;height:12px;background:#27AE60;border-radius:50%;'></span> GREEN alert<br>
-              <span style='display:inline-block;width:14px;height:3px;background:#1F618D;'></span> River<br>
+              <svg width="22" height="12" style="vertical-align:middle;">
+                <path d="M1,10 Q7,2 12,8 T21,3" stroke="#C0392B" stroke-width="3" fill="none"/>
+              </svg> River with RED alert<br>
+              <svg width="22" height="12" style="vertical-align:middle;">
+                <path d="M1,10 Q7,2 12,8 T21,3" stroke="#F39C12" stroke-width="3" fill="none"/>
+              </svg> River with AMBER alert<br>
+              <svg width="22" height="12" style="vertical-align:middle;">
+                <path d="M1,10 Q7,2 12,8 T21,3" stroke="#27AE60" stroke-width="3" fill="none"/>
+              </svg> River with GREEN alert<br>
+              <svg width="22" height="12" style="vertical-align:middle;">
+                <path d="M1,10 Q7,2 12,8 T21,3" stroke="#1F618D" stroke-width="2" fill="none"/>
+              </svg> River (no gauge)<br>
               <span style='display:inline-block;width:14px;height:10px;background:rgba(93,173,226,0.4);border:1px solid #2C3E50;'></span> Watershed<br>
-              <span style='display:inline-block;width:14px;height:10px;background:rgba(30,58,138,0.5);'></span> Flood extent
+              <span style='display:inline-block;width:14px;height:10px;background:rgba(30,58,138,0.5);'></span> Peak flood extent<br>
+              <span style='display:inline-block;width:14px;height:2px;border-top:2px dashed #1B2631;'></span> Nigeria boundary
             </div>
             {% endmacro %}
             """
