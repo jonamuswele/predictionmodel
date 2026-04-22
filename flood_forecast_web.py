@@ -1,4 +1,4 @@
-# flood_forecast_web.py - full-page map, silent loading, layered waterways
+# flood_forecast_web.py - Top navigation bar, full-page map
 
 from __future__ import annotations
 
@@ -29,11 +29,10 @@ except Exception:
 # ===========================================================================
 
 # Nigeria bounding box for fit_bounds (lat_min, lon_min, lat_max, lon_max)
-# Adjusted to show the full country
 NIGERIA_BOUNDS = [[4.0, 2.5], [14.0, 14.7]]
 NIGERIA_CENTER = [9.5, 8.0]
 
-# Named rivers we want to promote to "major" styling when they appear in OSM.
+# Named rivers we want to promote to "major" styling
 MAJOR_RIVER_NAMES = {
     "niger", "benue", "kaduna", "sokoto", "gongola", "komadugu", "komadugu yobe",
     "yobe", "cross", "ogun", "osun", "anambra", "hadejia", "katsina-ala",
@@ -68,9 +67,6 @@ class ProfessionalDataManager:
         if 'data_downloaded_from_r2' not in st.session_state:
             st.session_state.data_downloaded_from_r2 = False
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     def _find_shp_by_keywords(self, keywords) -> Optional[Path]:
         for p in self.data_dir.rglob("*.shp"):
             name = p.name.lower()
@@ -86,9 +82,6 @@ class ProfessionalDataManager:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Public load pipeline
-    # ------------------------------------------------------------------
     def ensure_data_loaded(self) -> bool:
         if self.watersheds is not None and self.rivers is not None:
             return True
@@ -107,9 +100,6 @@ class ProfessionalDataManager:
 
         return self._load_from_local_cache()
 
-    # ------------------------------------------------------------------
-    # R2 sync
-    # ------------------------------------------------------------------
     def _sync_geojson_prefix(self) -> bool:
         try:
             keys = self.r2.list_files("geojson/")
@@ -128,15 +118,11 @@ class ProfessionalDataManager:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Load cached data into memory
-    # ------------------------------------------------------------------
     def _load_from_local_cache(self) -> bool:
         try:
             import geopandas as gpd
             from shapely.geometry import box, mapping
 
-            # Boundary
             boundary_path = self.data_dir / "nigeria_boundary.geojson"
             if boundary_path.exists():
                 try:
@@ -158,10 +144,6 @@ class ProfessionalDataManager:
                     nigeria_basins['geometry'] = nigeria_basins['geometry'].buffer(0)
                     nigeria_basins = nigeria_basins[nigeria_basins.is_valid]
                     self.watersheds = json.loads(nigeria_basins.to_json())
-                    self.watersheds['metadata'] = {
-                        'source': basin_shp.name,
-                        'count': len(nigeria_basins),
-                    }
                 except Exception:
                     pass
 
@@ -176,7 +158,6 @@ class ProfessionalDataManager:
             if major_shp and minor_shp and major_shp.resolve() == minor_shp.resolve():
                 minor_shp = None
 
-            # OSM / HOTOSM waterways -- this is our primary source.
             if minor_shp and minor_shp.exists():
                 try:
                     gdf = gpd.read_file(minor_shp)
@@ -199,7 +180,6 @@ class ProfessionalDataManager:
                     clipped = clipped[~clipped.geometry.is_empty]
                     clipped = clipped[clipped.geometry.is_valid]
 
-                    # Cap for render performance.
                     if len(clipped) > 4000:
                         clipped = clipped.copy()
                         clipped['length_deg'] = clipped.geometry.length
@@ -220,7 +200,6 @@ class ProfessionalDataManager:
                                     else 'stream')
                         waterway = str(waterway).lower()
 
-                        # Promote named major rivers to "major_river" class
                         category = waterway
                         if waterway == 'river' and name:
                             lname = name.lower().strip()
@@ -244,7 +223,6 @@ class ProfessionalDataManager:
                 except Exception:
                     pass
 
-            # Natural Earth major rivers -- fallback only.
             if not any(f['properties']['category'] == 'major_river'
                        for f in all_features):
                 if major_shp and major_shp.exists():
@@ -303,9 +281,6 @@ class ProfessionalDataManager:
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Fallbacks
-    # ------------------------------------------------------------------
     def _get_nigeria_boundary_gdf(self):
         import geopandas as gpd
         from shapely.geometry import box
@@ -357,10 +332,7 @@ class ProfessionalDataManager:
 
 class FloodForecastWebApp:
 
-    PAGES = ["🗺️  Map", "📤 Upload Data", "📊 Forecast & Alerts",
-             "📈 Raw Data", "📚 Instructions", "ℹ️  About"]
-
-    ALERT_HEX = {"RED": "#C0392B", "AMBER": "#F39C12", "GREEN": "#27AE60"}
+    PAGES = ["🗺️ Map", "📤 Upload", "📊 Alerts", "📈 Data", "📚 Info", "ℹ️ About"]
 
     def __init__(self):
         defaults = {
@@ -414,16 +386,13 @@ class FloodForecastWebApp:
             control_scale=True,
             zoom_control=True,
         )
-        # Fit bounds to show all of Nigeria
         fmap.fit_bounds(NIGERIA_BOUNDS)
         
-        # Constrain panning so the user stays on Nigeria
         fmap.options['maxBounds'] = [
             [NIGERIA_BOUNDS[0][0] - 2, NIGERIA_BOUNDS[0][1] - 2],
             [NIGERIA_BOUNDS[1][0] + 2, NIGERIA_BOUNDS[1][1] + 2],
         ]
 
-        # Fullscreen + mouse coords
         Fullscreen(position='topleft',
                    title='Fullscreen',
                    title_cancel='Exit fullscreen',
@@ -485,7 +454,7 @@ class FloodForecastWebApp:
                 pass
         watershed_fg.add_to(fmap)
 
-        # Rivers split into four toggleable layers.
+        # Rivers
         if self.data_manager.rivers and self.data_manager.rivers.get('features'):
             features = self.data_manager.rivers['features']
 
@@ -535,7 +504,6 @@ class FloodForecastWebApp:
                       {"color": "#003366", "weight": 3.0,
                        "opacity": 0.98, "fillOpacity": 0})
 
-        # Compact legend
         legend_html = """
         {% macro html(this, kwargs) %}
         <div style="position: fixed; bottom: 18px; left: 12px; z-index: 9999;
@@ -561,32 +529,94 @@ class FloodForecastWebApp:
         return fmap.get_root().render()
 
     # ------------------------------------------------------------------
-    # Page: Map
+    # Page: Map (Full width, no sidebar)
     # ------------------------------------------------------------------
     def _render_map_page(self):
-        # Keep sidebar visible but make map fill remaining space
+        # Hide Streamlit's default sidebar and make map full width
         st.markdown(
             """
             <style>
-            #MainMenu, header { visibility: hidden; }
-            footer { display: none; }
+            #MainMenu, header, footer { visibility: hidden; display: none; }
+            .stApp header { display: none; }
+            .stApp > div:first-child { display: none; }
+            [data-testid="stSidebar"] { display: none; }
             .block-container {
-                padding-top: 0 !important;
-                padding-bottom: 0 !important;
+                padding: 0 !important;
+                margin: 0 !important;
                 max-width: 100% !important;
             }
-            section[data-testid="stSidebar"] > div {
-                padding-top: 1rem;
+            section[data-testid="stAppViewBlockContainer"] {
+                padding: 0 !important;
             }
             .element-container iframe {
                 width: 100% !important;
-                height: calc(100vh - 80px) !important;
+                height: calc(100vh - 50px) !important;
                 border: 0 !important;
+            }
+            .top-nav {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                background: #1a1a2e;
+                padding: 10px 20px;
+                z-index: 10000;
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+                font-family: -apple-system, sans-serif;
+            }
+            .top-nav button {
+                background: transparent;
+                border: none;
+                color: #eee;
+                font-size: 16px;
+                font-weight: 500;
+                padding: 8px 20px;
+                cursor: pointer;
+                border-radius: 8px;
+                transition: all 0.2s;
+            }
+            .top-nav button:hover {
+                background: #16213e;
+                color: white;
+            }
+            .top-nav button.active {
+                background: #0f3460;
+                color: #e94560;
             }
             </style>
             """,
             unsafe_allow_html=True,
         )
+
+        # Create top navigation bar
+        nav_buttons = []
+        for page in self.PAGES:
+            is_active = st.session_state.page == page
+            active_class = 'active' if is_active else ''
+            nav_buttons.append(f'<button class="{active_class}" onclick="parent.postMessage({{type: "streamlit:setComponentValue", value: \'{page}\'}}, \'*\')">{page}</button>')
+        
+        nav_html = f'<div class="top-nav">{"".join(nav_buttons)}</div>'
+        
+        # Add JavaScript for navigation
+        st.markdown(f"""
+        {nav_html}
+        <script>
+        document.querySelectorAll('.top-nav button').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                const pageName = btn.innerText;
+                // Update active state
+                document.querySelectorAll('.top-nav button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                // Send to Streamlit
+                const event = new CustomEvent('streamlit:setComponentValue', {{detail: pageName}});
+                window.parent.dispatchEvent(event);
+            }});
+        }});
+        </script>
+        """, unsafe_allow_html=True)
 
         if st.session_state.system is None:
             with st.spinner("Initializing forecast system..."):
@@ -603,110 +633,122 @@ class FloodForecastWebApp:
             st.error("Could not generate map. Check R2 contents.")
 
     # ------------------------------------------------------------------
-    # Page: Upload Data (diagnostics)
+    # Other pages
     # ------------------------------------------------------------------
     def _render_upload_page(self):
-        st.title("Upload Data")
+        st.title("📤 Upload Data")
         st.info(
             "### Expected files under `geojson/` in R2\n"
             "- `hybas_af_lev06_v1c.zip` — HydroBASINS watersheds\n"
             "- `nigeria_boundary.geojson` — Nigeria boundary\n"
             "- `ne_10m_rivers.zip` — Natural Earth major rivers (fallback)\n"
-            "- HOTOSM / OSM waterways shapefile (zip or sidecars) — the "
-            "app matches filenames containing `hotosm`, `waterway`, "
-            "`water_lines`, or `nga_water`.\n\n"
-            "The app mirrors everything under `geojson/`, extracts any "
-            "zips, and discovers shapefiles by keyword on disk."
+            "- HOTOSM / OSM waterways shapefile\n\n"
+            "The app mirrors everything under `geojson/`, extracts zips, and discovers shapefiles by keyword."
         )
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("List R2 contents"):
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("📋 List R2 contents"):
                 if self.r2:
-                    st.write(self.r2.list_files("geojson/") or "(empty)")
+                    files = self.r2.list_files("geojson/")
+                    if files:
+                        st.write(files)
+                    else:
+                        st.info("No files found in geojson/")
                 else:
                     st.error("R2 not configured")
-        with c2:
-            if st.button("Show local files"):
-                try:
-                    items = sorted(
-                        str(p.relative_to(self.data_manager.data_dir))
-                        for p in self.data_manager.data_dir.rglob("*")
-                        if p.is_file()
-                    )
-                    st.write(items or "(empty)")
-                except Exception as e:
-                    st.error(str(e))
-        with c3:
-            if st.button("Force re-sync from R2"):
+        with col2:
+            if st.button("🔄 Force re-sync from R2"):
                 st.session_state.data_downloaded_from_r2 = False
                 try:
-                    shutil.rmtree(self.data_manager.data_dir,
-                                  ignore_errors=True)
-                    self.data_manager.data_dir.mkdir(
-                        parents=True, exist_ok=True
-                    )
+                    shutil.rmtree(self.data_manager.data_dir, ignore_errors=True)
+                    self.data_manager.data_dir.mkdir(parents=True, exist_ok=True)
                     self.data_manager.watersheds = None
                     self.data_manager.rivers = None
                     self.data_manager.boundary = None
                     st.success("Cache cleared — reload the Map page.")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Cache clear failed: {e}")
+
+    def _render_alerts_page(self):
+        st.title("📊 Forecast & Alerts")
+        if st.session_state.forecast_report:
+            st.json(st.session_state.forecast_report)
+        else:
+            st.info("No forecast data available. Run the forecast system first.")
+
+    def _render_data_page(self):
+        st.title("📈 Raw Data")
+        if st.session_state.system:
+            st.write("System outputs are available in the output directory.")
+            st.info("Use the Upload page to sync data from R2.")
+        else:
+            st.info("No data available. Initialize the system first.")
+
+    def _render_info_page(self):
+        st.title("📚 Instructions")
+        st.markdown("""
+        ### How to Use This App
+        
+        **Map Navigation:**
+        - Use mouse/touch to pan and zoom
+        - Click the layer control (top-right) to toggle different waterway types
+        - Use fullscreen button (top-left) for better viewing
+        
+        **Data Layers:**
+        - **Major rivers** (thick dark blue) - Niger, Benue, Kaduna, etc.
+        - **Rivers** (medium blue) - Smaller named rivers
+        - **Streams** (thin light blue) - Minor waterways
+        - **Canals** (dashed blue) - Man-made channels
+        - **Drains** (very thin) - Drainage ditches
+        - **Watersheds** (semi-transparent) - Hydrological basins
+        
+        **Data Sources:**
+        - Watersheds: HydroBASINS v1c
+        - Waterways: HOTOSM OpenStreetMap
+        - Boundary: Natural Earth
+        """)
+
+    def _render_about_page(self):
+        st.title("ℹ️ About")
+        st.markdown("""
+        ### Nigeria Flood Forecast System
+        
+        This application displays hydrological data for Nigeria:
+        
+        - **139 watershed basins** from HydroBASINS (Level 6)
+        - **Thousands of waterways** from HOTOSM OpenStreetMap
+        - **Nigeria boundary** from Natural Earth
+        
+        **Technology Stack:**
+        - Streamlit for the web interface
+        - Folium for interactive maps
+        - GeoPandas for geospatial processing
+        - Cloudflare R2 for data storage
+        
+        **Data is automatically downloaded from R2 on first use and cached locally.**
+        """)
 
     # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
     def render(self):
-        # Navigation sidebar - always visible
-        with st.sidebar:
-            st.markdown("### 🗺️ Navigation")
-            st.session_state.page = st.radio(
-                "Menu",
-                self.PAGES,
-                key="nav_page_radio",
-                label_visibility="collapsed",
-            )
-            st.markdown("---")
-            if st.session_state.r2_connected:
-                st.success("✅ R2 connected")
-            else:
-                st.warning("⚠️ R2 not configured")
-
+        # Handle navigation via session state
         page = st.session_state.page
+        
         if page == self.PAGES[0]:
             self._render_map_page()
         elif page == self.PAGES[1]:
             self._render_upload_page()
         elif page == self.PAGES[2]:
-            st.title("Forecast & Alerts")
-            st.info("Forecast system will be displayed here.")
+            self._render_alerts_page()
         elif page == self.PAGES[3]:
-            st.title("Raw Data")
-            st.info("Raw data export will be displayed here.")
+            self._render_data_page()
         elif page == self.PAGES[4]:
-            st.title("Instructions")
-            st.markdown("""
-            ### How to Use This App
-            1. The map shows Nigeria's hydrological features
-            2. Use the layer control (top-right) to toggle different waterway types
-            3. Zoom in to see smaller streams
-            4. Watershed boundaries are shown as semi-transparent polygons
-            """)
+            self._render_info_page()
         elif page == self.PAGES[5]:
-            st.title("About")
-            st.markdown("""
-            ### Nigeria Flood Forecast System
-            
-            This application displays:
-            - **Watersheds**: HydroBASINS data (Level 6)
-            - **Waterways**: HOTOSM OpenStreetMap data with:
-              - Major rivers (thick dark blue)
-              - Rivers (medium blue)
-              - Streams (thin light blue)
-              - Canals (dashed)
-              - Drains (very thin)
-            
-            Data is loaded from Cloudflare R2 and cached locally.
-            """)
+            self._render_about_page()
 
 
 # ===========================================================================
@@ -718,7 +760,7 @@ def main():
         page_title="Nigeria Flood Forecast",
         page_icon="🌊",
         layout="wide",
-        initial_sidebar_state="expanded",  # Changed from "collapsed" to "expanded"
+        initial_sidebar_state="collapsed",  # Hide the default sidebar
     )
     app = FloodForecastWebApp()
     app.render()
