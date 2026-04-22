@@ -74,7 +74,7 @@ class ProfessionalDataManager:
         try:
             # List all files in R2 to debug
             st.info("🔍 Checking files in R2 bucket...")
-            all_files = self.r2.list_files("geojson/")
+            all_files = self.r2.list_files("")
             st.write(f"Files found in geojson/: {all_files}")
             
             # 1. Download HydroBASINS watersheds
