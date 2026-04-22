@@ -1,4 +1,4 @@
-# flood_forecast_web.py - Complete working version
+# flood_forecast_web.py - FIXED VERSION
 
 from __future__ import annotations
 
@@ -74,15 +74,26 @@ class ProfessionalDataManager:
         try:
             # List all files in R2 to debug
             st.info("Checking files in R2 bucket...")
-            all_files = self.r2.list_files("")
-            st.write(f"Files found: {all_files}")
             
-            # 1. Download HydroBASINS watersheds (check both with and without geojson/ prefix)
+            # Use list_files with empty string to get all files
+            all_files = self.r2.list_files("")
+            st.write(f"Files found in R2: {all_files}")
+            
+            # 1. Download HydroBASINS watersheds
             hydrobasins_remote = None
-            if self.r2.exists("hybas_af_lev06_v1c.zip"):
-                hydrobasins_remote = "hybas_af_lev06_v1c.zip"
-            elif self.r2.exists("geojson/hybas_af_lev06_v1c.zip"):
-                hydrobasins_remote = "geojson/hybas_af_lev06_v1c.zip"
+            # Check all possible paths
+            possible_hydro_paths = [
+                "hybas_af_lev06_v1c.zip",
+                "geojson/hybas_af_lev06_v1c.zip",
+                "/hybas_af_lev06_v1c.zip",
+                "/geojson/hybas_af_lev06_v1c.zip"
+            ]
+            
+            for path in possible_hydro_paths:
+                if self.r2.exists(path):
+                    hydrobasins_remote = path
+                    st.write(f"Found HydroBASINS at: {path}")
+                    break
             
             if hydrobasins_remote:
                 st.info("Downloading HydroBASINS watershed data (523 MB - please wait)...")
@@ -100,10 +111,18 @@ class ProfessionalDataManager:
             
             # 2. Download Nigeria boundary
             boundary_remote = None
-            if self.r2.exists("nigeria_boundary.geojson"):
-                boundary_remote = "nigeria_boundary.geojson"
-            elif self.r2.exists("geojson/nigeria_boundary.geojson"):
-                boundary_remote = "geojson/nigeria_boundary.geojson"
+            possible_boundary_paths = [
+                "nigeria_boundary.geojson",
+                "geojson/nigeria_boundary.geojson",
+                "/nigeria_boundary.geojson",
+                "/geojson/nigeria_boundary.geojson"
+            ]
+            
+            for path in possible_boundary_paths:
+                if self.r2.exists(path):
+                    boundary_remote = path
+                    st.write(f"Found boundary at: {path}")
+                    break
             
             if boundary_remote:
                 boundary_path = self.data_dir / "nigeria_boundary.geojson"
@@ -112,17 +131,19 @@ class ProfessionalDataManager:
             
             # 3. Download rivers (Natural Earth)
             rivers_remote = None
-            # Check for both possible filenames
-            possible_river_files = [
+            possible_river_paths = [
                 "ne_10m_rivers.zip",
                 "ne_10m_rivers_lake_centerlines.zip",
                 "geojson/ne_10m_rivers.zip",
-                "geojson/ne_10m_rivers_lake_centerlines.zip"
+                "geojson/ne_10m_rivers_lake_centerlines.zip",
+                "/ne_10m_rivers.zip",
+                "/geojson/ne_10m_rivers.zip"
             ]
             
-            for river_file in possible_river_files:
-                if self.r2.exists(river_file):
-                    rivers_remote = river_file
+            for path in possible_river_paths:
+                if self.r2.exists(path):
+                    rivers_remote = path
+                    st.write(f"Found rivers at: {path}")
                     break
             
             if rivers_remote:
@@ -137,6 +158,8 @@ class ProfessionalDataManager:
             
         except Exception as e:
             st.error(f"Download failed: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             return False
     
     def _load_from_local_cache(self) -> bool:
@@ -145,21 +168,23 @@ class ProfessionalDataManager:
             import geopandas as gpd
             from shapely.geometry import box
             
-            # Load watersheds from HydroBASINS - try different possible filenames
-            shp_paths = [
-                self.data_dir / "hybas_af_lev06_v1c.shp",
-                self.data_dir / "hybas_af_lev06_v1c" / "hybas_af_lev06_v1c.shp",
-            ]
+            # First, check what files we have locally
+            st.write("Local files in data_dir:", list(self.data_dir.glob("*")))
             
-            shp_path = None
-            for path in shp_paths:
-                if path.exists():
-                    shp_path = path
-                    break
+            # Load watersheds from HydroBASINS
+            shp_path = self.data_dir / "hybas_af_lev06_v1c.shp"
+            if not shp_path.exists():
+                # Try looking in subdirectories
+                for subdir in self.data_dir.glob("*/"):
+                    potential_shp = subdir / "hybas_af_lev06_v1c.shp"
+                    if potential_shp.exists():
+                        shp_path = potential_shp
+                        break
             
-            if shp_path and shp_path.exists():
+            if shp_path.exists():
                 st.info("Loading watershed boundaries...")
                 basins = gpd.read_file(shp_path)
+                st.write(f"Loaded basins shapefile with {len(basins)} features")
                 
                 # Get Nigeria boundary
                 nigeria = self._get_nigeria_boundary_gdf()
@@ -175,22 +200,18 @@ class ProfessionalDataManager:
                     'count': len(nigeria_basins)
                 }
                 st.success(f"✅ Loaded {len(nigeria_basins)} watershed basins")
+            else:
+                st.warning(f"Shapefile not found at {shp_path}")
             
-            # Load rivers - try different possible filenames
-            rivers_shp_paths = [
-                self.data_dir / "ne_10m_rivers_lake_centerlines.shp",
-                self.data_dir / "ne_10m_rivers.shp",
-            ]
+            # Load rivers
+            rivers_shp = self.data_dir / "ne_10m_rivers_lake_centerlines.shp"
+            if not rivers_shp.exists():
+                rivers_shp = self.data_dir / "ne_10m_rivers.shp"
             
-            rivers_shp = None
-            for path in rivers_shp_paths:
-                if path.exists():
-                    rivers_shp = path
-                    break
-            
-            if rivers_shp and rivers_shp.exists():
+            if rivers_shp.exists():
                 st.info("Loading river network...")
                 rivers = gpd.read_file(rivers_shp)
+                st.write(f"Loaded rivers shapefile with {len(rivers)} features")
                 
                 # Filter to Nigeria
                 nigeria = self._get_nigeria_boundary_gdf()
@@ -218,6 +239,8 @@ class ProfessionalDataManager:
             
         except Exception as e:
             st.error(f"Error loading data: {e}")
+            import traceback
+            st.code(traceback.format_exc())
             return False
     
     def _get_nigeria_boundary_gdf(self):
@@ -303,20 +326,21 @@ class FloodForecastWebApp:
             "is_demo": True,
             "horizon_days": 14,
             "forecast_start": None,
+            "r2_connected": False,  # Track R2 connection status
         }
         for k, v in defaults.items():
             if k not in st.session_state:
                 st.session_state[k] = v
         
-        # Initialize R2 storage
+        # Initialize R2 storage (don't show messages here)
         self.r2 = None
         if cloud_storage is not None:
             try:
                 self.r2 = cloud_storage.get_r2_from_secrets(st.secrets)
                 if self.r2:
-                    st.success(f"✅ Connected to R2 bucket: {self.r2.bucket}")
-            except Exception as e:
-                st.warning(f"R2 not available: {e}")
+                    st.session_state.r2_connected = True
+            except Exception:
+                pass
         
         # Initialize data manager
         self.data_manager = ProfessionalDataManager(self.r2)
@@ -398,6 +422,10 @@ class FloodForecastWebApp:
     
     def render(self):
         """Render the app."""
+        # Show R2 connection status only when on the map page
+        if st.session_state.page == self.PAGES[0] and st.session_state.r2_connected:
+            st.success(f"✅ Connected to R2 bucket: nigeriahydro")
+        
         with st.sidebar:
             st.session_state.page = st.radio("Navigation", self.PAGES)
         
