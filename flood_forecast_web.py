@@ -16,6 +16,11 @@ import streamlit.components.v1 as components
 
 import flood_forecast_nigeria as ffn
 
+try:
+    import cloud_storage
+except Exception:  # pragma: no cover - optional dep
+    cloud_storage = None  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Page configuration
 # ---------------------------------------------------------------------------
@@ -88,10 +93,19 @@ class FloodForecastWebApp:
             "is_demo": True,
             "horizon_days": 14,
             "forecast_start": None,
+            "r2_urls": {},
+            "r2_seeded": False,
         }
         for k, v in defaults.items():
             if k not in st.session_state:
                 st.session_state[k] = v
+        # Optional Cloudflare R2 persistence. Returns None if not configured.
+        self.r2 = None
+        if cloud_storage is not None:
+            try:
+                self.r2 = cloud_storage.get_r2_from_secrets(st.secrets)
+            except Exception:
+                self.r2 = None
 
     # ------------------------------------------------------------------
     # Filesystem
@@ -123,6 +137,58 @@ class FloodForecastWebApp:
 
     def _log(self, msg: str) -> None:
         st.session_state.run_log.append(msg)
+
+    # ------------------------------------------------------------------
+    # Cloudflare R2 (optional)
+    # ------------------------------------------------------------------
+    def _r2_enabled(self) -> bool:
+        return self.r2 is not None
+
+    def _r2_seed_inputs(self, wd: Path) -> None:
+        """Pull any ``inputs/`` prefix from R2 into the local workdir.
+
+        This is how persistent uploads survive a Streamlit Cloud restart:
+        previously uploaded gauges/DEM/met/NWP live under the bucket's
+        ``inputs/`` prefix and get downloaded into ``workdir/data/`` at the
+        start of a run. Idempotent — only runs once per session.
+        """
+        if not self._r2_enabled() or st.session_state.r2_seeded:
+            return
+        try:
+            n = self.r2.sync_prefix_to_local("inputs", wd / "data")
+            if n:
+                self._log(f"R2: seeded {n} file(s) from inputs/ into workdir.")
+        except Exception as exc:
+            self._log(f"R2 seed failed (continuing without cloud data): {exc}")
+        st.session_state.r2_seeded = True
+
+    def _r2_mirror_upload(self, local_path: Path, remote_key: str) -> None:
+        """Mirror a user upload to R2 under ``inputs/`` for persistence."""
+        if not self._r2_enabled():
+            return
+        try:
+            url = self.r2.upload_file(local_path, f"inputs/{remote_key}")
+            if url:
+                self._log(f"R2: mirrored {local_path.name} -> {url}")
+        except Exception as exc:
+            self._log(f"R2 mirror failed: {exc}")
+
+    def _r2_publish_outputs(self, cfg: ffn.Config, run_id: str) -> None:
+        """Upload generated outputs (map, plots, CSVs, alerts) to R2."""
+        if not self._r2_enabled():
+            return
+        out_dir = Path(cfg.output_dir)
+        if not out_dir.exists():
+            return
+        try:
+            urls = self.r2.sync_local_to_prefix(
+                out_dir, f"runs/{run_id}",
+                patterns=["*.html", "*.png", "*.csv", "*.json", "*.geojson"],
+            )
+            st.session_state.r2_urls = {Path(u).name: u for u in urls}
+            self._log(f"R2: published {len(urls)} artefact(s) under runs/{run_id}/.")
+        except Exception as exc:
+            self._log(f"R2 publish failed: {exc}")
 
     # ------------------------------------------------------------------
     # Templates
@@ -191,6 +257,13 @@ class FloodForecastWebApp:
         dest.parent.mkdir(parents=True, exist_ok=True)
         with open(dest, "wb") as fh:
             fh.write(uploaded.getvalue())
+        # Mirror to R2 so the upload persists across Streamlit Cloud restarts.
+        wd = self._workdir()
+        try:
+            rel = dest.relative_to(wd / "data").as_posix()
+        except ValueError:
+            rel = dest.name
+        self._r2_mirror_upload(dest, rel)
         return dest
 
     def _build_config(self, start_date: str, end_date: str,
@@ -279,6 +352,64 @@ class FloodForecastWebApp:
     # ------------------------------------------------------------------
     # Pipeline execution
     # ------------------------------------------------------------------
+    def _patch_basin_precip(self, system: ffn.FloodForecastSystem,
+                            cfg: ffn.Config) -> None:
+        """Class-level monkey-patch for WatershedDelineator.get_basin_mean_precip.
+
+        The deployed flood_forecast_nigeria.py calls rasterio.open(chirps_path)
+        unconditionally. When no real CHIRPS raster is available (the common
+        web-demo case) this raises RasterioIOError. We replace the method with
+        a synthetic gamma-distributed wet/dry-season rain generator that
+        matches the fallback behaviour of the local reference implementation.
+        Patch is applied once; idempotent.
+        """
+        if getattr(ffn.WatershedDelineator, "_web_precip_patched", False):
+            return
+
+        def _synthetic_basin_precip(self, basins, chirps_path):
+            idx = pd.date_range(self.config.start_date,
+                                self.config.end_date, freq="D")
+            # Try real raster first if a valid file is provided.
+            try:
+                p = Path(chirps_path)
+                if (p.exists() and p.is_file()
+                        and hasattr(ffn, "rasterio")
+                        and hasattr(ffn, "rio_mask")):
+                    df = pd.DataFrame(index=idx)
+                    with ffn.rasterio.open(p) as src:
+                        for _, row in basins.iterrows():
+                            if row["geometry"] is None:
+                                df[row["station_id"]] = 0.0
+                                continue
+                            try:
+                                out, _ = ffn.rio_mask.mask(
+                                    src, [ffn.mapping(row["geometry"])],
+                                    crop=True)
+                                df[row["station_id"]] = float(
+                                    np.ma.masked_invalid(out).mean())
+                            except Exception:
+                                df[row["station_id"]] = 0.0
+                    return df
+            except Exception:
+                pass
+            # Synthetic fallback: gamma-distributed wet-season rain.
+            rng = np.random.default_rng(seed=20260421)
+            months = np.array([d.month for d in idx])
+            wet = np.isin(months, [5, 6, 7, 8, 9, 10])
+            data = {}
+            for sid in basins["station_id"]:
+                p = np.where(wet,
+                             rng.gamma(0.8, 12.0, len(idx)),
+                             rng.gamma(0.3, 2.5, len(idx)))
+                data[sid] = np.clip(p, 0.0, None)
+            df = pd.DataFrame(data, index=idx)
+            df.index.name = "date"
+            return df
+
+        ffn.WatershedDelineator.get_basin_mean_precip = _synthetic_basin_precip
+        ffn.WatershedDelineator._web_precip_patched = True
+        self._log("Patched get_basin_mean_precip with synthetic fallback.")
+
     def _patch_with_user_met(self, system: ffn.FloodForecastSystem,
                              cfg: ffn.Config, user_met: pd.DataFrame) -> None:
         """Instance-level monkey-patch: use the user met CSV verbatim."""
@@ -343,11 +474,14 @@ class FloodForecastWebApp:
         """End-to-end run; stores the system + report in session state."""
         try:
             cfg = self._build_config(start_date, end_date, horizon_days)
+            # Pull any persisted inputs from R2 before we start saving uploads.
+            self._r2_seed_inputs(self._workdir())
             self._ensure_gauge_csv(uploaded_gauge, cfg)
             self._ensure_dem(uploaded_dem, cfg)
             user_met = self._ensure_met(uploaded_met)
 
             system = ffn.FloodForecastSystem(cfg)
+            self._patch_basin_precip(system, cfg)
             if user_met is not None:
                 self._patch_with_user_met(system, cfg, user_met)
             else:
@@ -358,6 +492,10 @@ class FloodForecastWebApp:
             p_df, e_df = self._build_nwp(uploaded_nwp, horizon_days, forecast_start)
             report = system.run_forecast(p_df, e_df)
             self._log(f"Forecast complete ({horizon_days} days from {forecast_start.date()}).")
+
+            # Publish outputs to R2 under runs/<timestamp>/.
+            run_id = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            self._r2_publish_outputs(cfg, run_id)
 
             st.session_state.system = system
             st.session_state.forecast_report = report
@@ -954,8 +1092,30 @@ HydrologicalModel, FloodRouter, AlertDashboard, FloodForecastSystem).
 The web layer never modifies the pipeline — it only orchestrates uploads,
 overrides the forecast horizon, and renders the outputs.
 
-### Run log
+### Cloud storage (Cloudflare R2)
 """)
+        if self._r2_enabled():
+            st.success(
+                f"R2 is configured (bucket: `{self.r2.bucket}`). "
+                "Uploads persist across restarts and every run publishes "
+                "artefacts under `runs/<timestamp>/`."
+            )
+            urls = st.session_state.get("r2_urls") or {}
+            if urls:
+                st.markdown("**Latest run artefacts:**")
+                for name, url in urls.items():
+                    st.markdown(f"- [{name}]({url})")
+            else:
+                st.caption("No run artefacts published yet.")
+        else:
+            st.info(
+                "R2 is not configured. Add an `[r2]` section to "
+                "`.streamlit/secrets.toml` (or the Streamlit Cloud secrets UI) "
+                "to enable persistence. Required keys: `endpoint_url`, "
+                "`access_key`, `secret_key`, `bucket_name`."
+            )
+
+        st.markdown("### Run log")
         if st.session_state.run_log:
             st.code("\n".join(st.session_state.run_log), language="text")
         else:
