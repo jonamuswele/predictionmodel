@@ -352,6 +352,32 @@ class FloodForecastWebApp:
     # ------------------------------------------------------------------
     # Pipeline execution
     # ------------------------------------------------------------------
+    def _patch_chirps_download(self) -> None:
+        """Short-circuit ``DataManager.download_chirps``.
+
+        The default implementation hammers
+        ``https://data.chc.ucsb.edu/products/CHIRPS-2.0/...`` three times per
+        month of history with a 1-2-4 s back-off. On Streamlit Cloud those
+        URLs return 404 (the public directory layout moved / IP-blocks
+        cloud egress), so a 2-year run wastes ~90 s of retries before the
+        downstream code falls back to synthetic met anyway. This patch makes
+        the function return immediately with a non-existent path so the
+        fallback triggers on attempt 0. Idempotent & class-level.
+        """
+        if getattr(ffn.DataManager, "_web_chirps_patched", False):
+            return
+
+        def _skip_download(self, year, month):  # type: ignore[no-redef]
+            # Return a path that does not exist so load_chirps_for_bbox
+            # treats CHIRPS as unavailable and uses generate_synthetic_met.
+            return Path(self.config.data_dir) / "chirps" / (
+                f"chirps-v2.0.{year}.{month:02d}.tif.gz"
+            )
+
+        ffn.DataManager.download_chirps = _skip_download
+        ffn.DataManager._web_chirps_patched = True
+        self._log("Patched download_chirps to skip network (uses synthetic met).")
+
     def _patch_basin_precip(self, system: ffn.FloodForecastSystem,
                             cfg: ffn.Config) -> None:
         """Class-level monkey-patch for WatershedDelineator.get_basin_mean_precip.
@@ -481,6 +507,7 @@ class FloodForecastWebApp:
             user_met = self._ensure_met(uploaded_met)
 
             system = ffn.FloodForecastSystem(cfg)
+            self._patch_chirps_download()
             self._patch_basin_precip(system, cfg)
             if user_met is not None:
                 self._patch_with_user_met(system, cfg, user_met)
@@ -757,6 +784,7 @@ class FloodForecastWebApp:
             st.session_state.page = st.radio(
                 " ", self.PAGES,
                 index=self.PAGES.index(st.session_state.page),
+                key="nav_page_radio",
                 label_visibility="collapsed",
             )
             st.divider()
@@ -848,7 +876,8 @@ class FloodForecastWebApp:
         with col_b:
             st.subheader("Forecast horizon")
             unit = st.radio("Unit", ["Days", "Weeks", "Months"],
-                            index=1, horizontal=True)
+                            index=1, horizontal=True,
+                            key="horizon_unit_radio")
             if unit == "Days":
                 v = st.slider("Length (days)", 1, 60, 14)
                 horizon_days = v
