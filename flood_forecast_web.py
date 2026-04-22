@@ -1,8 +1,9 @@
-# flood_forecast_web.py - robust R2 sync + flexible shapefile discovery
+# flood_forecast_web.py - full-page map, silent loading, layered waterways
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import tempfile
 import traceback
@@ -22,18 +23,35 @@ try:
 except Exception:
     cloud_storage = None
 
+
 # ===========================================================================
-#              PROFESSIONAL DATA MANAGER (Downloads from R2)
+#                          CONSTANTS / CONFIG
+# ===========================================================================
+
+# Nigeria bounding box for fit_bounds + max_bounds (lat_min, lon_min, lat_max, lon_max).
+NIGERIA_BOUNDS = [[3.8, 2.3], [14.2, 15.0]]
+NIGERIA_CENTER = [9.0, 8.1]
+
+# Named rivers we want to promote to "major" styling when they appear in OSM.
+MAJOR_RIVER_NAMES = {
+    "niger", "benue", "kaduna", "sokoto", "gongola", "komadugu", "komadugu yobe",
+    "yobe", "cross", "ogun", "osun", "anambra", "hadejia", "katsina-ala",
+    "katsina ala", "donga", "taraba", "shari", "chari", "imo", "kwa ibo",
+    "kwa iboe", "qua iboe", "forcados", "escravos", "nun", "orashi",
+    "ogun river", "kaduna river", "benue river", "niger river", "sokoto river",
+}
+
+
+# ===========================================================================
+#                     PROFESSIONAL DATA MANAGER (R2)
 # ===========================================================================
 
 class ProfessionalDataManager:
     """Downloads professional hydrological data from R2 bucket."""
 
-    # Keywords used to classify shapefiles found on disk.
-    BASIN_KEYWORDS  = ("hybas", "basin", "watershed")
+    BASIN_KEYWORDS = ("hybas", "basin", "watershed")
     MAJOR_RIV_KEYWORDS = ("ne_10m_rivers", "ne_50m_rivers",
                           "natural_earth", "rivers_lake_centerlines")
-    # HOTOSM / OSM detailed waterways — the "smaller rivers"
     MINOR_RIV_KEYWORDS = ("hotosm", "waterway", "osm_water", "water_lines",
                           "nga_water")
 
@@ -44,18 +62,15 @@ class ProfessionalDataManager:
 
         self.watersheds = None
         self.rivers = None
-        self.water_bodies = None
         self.boundary = None
 
-        # Track download status (per-session)
         if 'data_downloaded_from_r2' not in st.session_state:
             st.session_state.data_downloaded_from_r2 = False
 
     # ------------------------------------------------------------------
-    # Shapefile discovery helpers
+    # Helpers
     # ------------------------------------------------------------------
     def _find_shp_by_keywords(self, keywords) -> Optional[Path]:
-        """Return the first .shp whose filename matches any keyword."""
         for p in self.data_dir.rglob("*.shp"):
             name = p.name.lower()
             if any(k in name for k in keywords):
@@ -67,32 +82,24 @@ class ProfessionalDataManager:
             with zipfile.ZipFile(zip_path, 'r') as z:
                 z.extractall(self.data_dir)
             return True
-        except Exception as e:
-            st.warning(f"Could not extract {zip_path.name}: {e}")
+        except Exception:
             return False
 
     # ------------------------------------------------------------------
-    # Load pipeline
+    # Public load pipeline
     # ------------------------------------------------------------------
     def ensure_data_loaded(self) -> bool:
         if self.watersheds is not None and self.rivers is not None:
             return True
-
         if not self.r2:
-            st.error("R2 storage not configured. Add R2 credentials to secrets.toml")
             return False
 
         if not st.session_state.data_downloaded_from_r2:
-            with st.spinner("Syncing hydrological data from R2 ..."):
-                if not self._sync_geojson_prefix():
-                    st.error("Failed to sync data from R2")
-                    return False
-                st.session_state.data_downloaded_from_r2 = True
+            if not self._sync_geojson_prefix():
+                return False
+            st.session_state.data_downloaded_from_r2 = True
 
-        # Extract every zip we now have on disk (idempotent).
         for z in self.data_dir.rglob("*.zip"):
-            # Skip if there's already an extracted shapefile whose stem
-            # starts with the zip stem.
             if any(self.data_dir.rglob(f"{z.stem}*.shp")):
                 continue
             self._extract_zip(z)
@@ -100,38 +107,24 @@ class ProfessionalDataManager:
         return self._load_from_local_cache()
 
     # ------------------------------------------------------------------
-    # R2 sync — mirror everything under geojson/
+    # R2 sync
     # ------------------------------------------------------------------
     def _sync_geojson_prefix(self) -> bool:
-        """Download every object under ``geojson/`` that isn't already
-        cached locally with the same size.
-        """
         try:
             keys = self.r2.list_files("geojson/")
             if not keys:
-                st.warning("No files found under geojson/ in R2.")
                 return False
-
-            st.caption(f"R2 geojson/ contains {len(keys)} objects")
             for key in keys:
-                # Strip the "geojson/" prefix to get the local relative path.
                 rel = key.split("geojson/", 1)[-1].lstrip("/")
                 if not rel:
                     continue
                 local = self.data_dir / rel
                 local.parent.mkdir(parents=True, exist_ok=True)
-
                 if local.exists() and local.stat().st_size > 0:
                     continue
-
-                if self.r2.download_file(key, local):
-                    st.caption(f"↓ {rel}")
-                else:
-                    st.warning(f"Download failed: {key}")
+                self.r2.download_file(key, local)
             return True
-        except Exception as e:
-            st.error(f"R2 sync failed: {e}")
-            st.code(traceback.format_exc())
+        except Exception:
             return False
 
     # ------------------------------------------------------------------
@@ -142,32 +135,22 @@ class ProfessionalDataManager:
             import geopandas as gpd
             from shapely.geometry import box, mapping
 
-            all_shps = list(self.data_dir.rglob("*.shp"))
-            if all_shps:
-                st.caption(
-                    "Shapefiles on disk: "
-                    + ", ".join(str(p.relative_to(self.data_dir)) for p in all_shps)
-                )
-            else:
-                st.warning("No .shp files on disk after sync.")
-
-            # ---------- Boundary ----------
+            # Boundary
             boundary_path = self.data_dir / "nigeria_boundary.geojson"
             if boundary_path.exists():
                 try:
                     with open(boundary_path, 'r') as f:
                         self.boundary = json.load(f)
-                except Exception as e:
-                    st.warning(f"Boundary load failed: {e}")
+                except Exception:
                     self.boundary = None
 
             nigeria_gdf = self._get_nigeria_boundary_gdf()
 
-            # ---------- Watersheds ----------
-            shp_path = self._find_shp_by_keywords(self.BASIN_KEYWORDS)
-            if shp_path and shp_path.exists():
+            # Watersheds
+            basin_shp = self._find_shp_by_keywords(self.BASIN_KEYWORDS)
+            if basin_shp and basin_shp.exists():
                 try:
-                    basins = gpd.read_file(shp_path)
+                    basins = gpd.read_file(basin_shp)
                     if basins.crs and basins.crs.to_epsg() != 4326:
                         basins = basins.to_crs("EPSG:4326")
                     nigeria_basins = gpd.clip(basins, nigeria_gdf)
@@ -175,71 +158,52 @@ class ProfessionalDataManager:
                     nigeria_basins = nigeria_basins[nigeria_basins.is_valid]
                     self.watersheds = json.loads(nigeria_basins.to_json())
                     self.watersheds['metadata'] = {
-                        'source': shp_path.name,
+                        'source': basin_shp.name,
                         'count': len(nigeria_basins),
                     }
-                    st.success(f"Loaded {len(nigeria_basins)} watershed basins from {shp_path.name}")
-                except Exception as e:
-                    st.warning(f"HydroBASINS load failed ({shp_path.name}): {e}")
+                except Exception:
+                    pass
 
             if self.watersheds is None:
                 self._create_fallback_watersheds()
 
-            # ---------- Rivers: major + minor ----------
+            # Rivers
             all_features: List[Dict[str, Any]] = []
 
-            major_shp = self._find_shp_by_keywords(self.MAJOR_RIV_KEYWORDS)
             minor_shp = self._find_shp_by_keywords(self.MINOR_RIV_KEYWORDS)
-
-            # Defensive: the same file shouldn't be loaded twice.
+            major_shp = self._find_shp_by_keywords(self.MAJOR_RIV_KEYWORDS)
             if major_shp and minor_shp and major_shp.resolve() == minor_shp.resolve():
                 minor_shp = None
 
-            # ---- Minor (HOTOSM / OSM waterways) ----
+            # OSM / HOTOSM waterways -- this is our primary source.
             if minor_shp and minor_shp.exists():
-                st.info(f"Loading smaller waterways from {minor_shp.name} ...")
                 try:
                     gdf = gpd.read_file(minor_shp)
-                    st.caption(
-                        f"  raw features: {len(gdf)} | columns: "
-                        + ", ".join(gdf.columns[:15])
-                    )
                     if gdf.crs and gdf.crs.to_epsg() != 4326:
                         gdf = gdf.to_crs("EPSG:4326")
-
-                    # Clip to Nigeria (with bbox fallback).
                     try:
                         clipped = gpd.clip(gdf, nigeria_gdf)
                     except Exception:
                         clipped = gdf[gdf.intersects(nigeria_gdf.unary_union)]
-
                     if len(clipped) == 0:
                         minx, miny, maxx, maxy = nigeria_gdf.total_bounds
                         bbox_poly = box(minx - 1, miny - 1, maxx + 1, maxy + 1)
                         clipped = gdf[gdf.intersects(bbox_poly)]
 
-                    # Filter to line waterways if a `waterway` column exists.
-                    # (HOTOSM uses this tag.) Keep river/stream/canal/drain.
                     if 'waterway' in clipped.columns:
                         wanted = ['river', 'stream', 'canal', 'drain',
                                   'ditch', 'tidal_channel']
-                        before = len(clipped)
                         clipped = clipped[clipped['waterway'].isin(wanted)]
-                        st.caption(
-                            f"  waterway filter: {before} → {len(clipped)}"
-                        )
 
                     clipped = clipped[~clipped.geometry.is_empty]
                     clipped = clipped[clipped.geometry.is_valid]
 
-                    # Cap at 3000 longest to keep render fast.
-                    if len(clipped) > 3000:
+                    # Cap for render performance.
+                    if len(clipped) > 4000:
                         clipped = clipped.copy()
                         clipped['length_deg'] = clipped.geometry.length
-                        clipped = clipped.nlargest(3000, 'length_deg')
-                        st.caption("  capped to 3000 longest features")
+                        clipped = clipped.nlargest(4000, 'length_deg')
 
-                    minor_count = 0
                     for idx, row in clipped.iterrows():
                         try:
                             geom_json = mapping(row.geometry)
@@ -253,109 +217,91 @@ class ProfessionalDataManager:
                         waterway = (row['waterway']
                                     if 'waterway' in row and row['waterway']
                                     else 'stream')
+                        waterway = str(waterway).lower()
+
+                        # Promote named major rivers to "major_river" class
+                        # so they render with heavier styling.
+                        category = waterway
+                        if waterway == 'river' and name:
+                            lname = name.lower().strip()
+                            # match whole-word against MAJOR_RIVER_NAMES
+                            if any(re.search(rf"\b{re.escape(m)}\b", lname)
+                                   for m in MAJOR_RIVER_NAMES):
+                                category = 'major_river'
+
                         if not name:
-                            name = f"{str(waterway).capitalize()}"
+                            name = waterway.capitalize()
 
                         all_features.append({
                             "type": "Feature",
                             "geometry": geom_json,
                             "properties": {
                                 "name": name,
-                                "waterway": str(waterway),
+                                "waterway": waterway,
+                                "category": category,
                                 "length_km": round(float(row.geometry.length) * 111.0, 1),
-                                "source": "OSM",
                             },
                         })
-                        minor_count += 1
+                except Exception:
+                    pass
 
-                    if minor_count:
-                        st.success(f"Loaded {minor_count} OSM waterway features")
-                    else:
-                        st.warning(
-                            "OSM shapefile loaded but 0 features remained "
-                            "after filtering — check the `waterway` column."
-                        )
-                except Exception as e:
-                    st.error(f"OSM waterways load failed: {e}")
-                    st.code(traceback.format_exc())
-            else:
-                st.info(
-                    "No OSM/HOTOSM waterway shapefile found on disk. "
-                    "Upload the HOTOSM export (all sidecars or the original "
-                    "zip) under `geojson/` in R2."
-                )
-
-            # ---- Major (Natural Earth) ----
-            if major_shp and major_shp.exists():
-                try:
-                    gdf = gpd.read_file(major_shp)
-                    st.caption(
-                        f"Major rivers source: {major_shp.name} "
-                        f"({len(gdf)} raw features)"
-                    )
-                    if gdf.crs and gdf.crs.to_epsg() != 4326:
-                        gdf = gdf.to_crs("EPSG:4326")
+            # Natural Earth major rivers -- fallback only.
+            if not any(f['properties']['category'] == 'major_river'
+                       for f in all_features):
+                if major_shp and major_shp.exists():
                     try:
-                        clipped = gpd.clip(gdf, nigeria_gdf)
-                    except Exception:
-                        clipped = gdf[gdf.intersects(nigeria_gdf.unary_union)]
-                    if len(clipped) == 0:
-                        minx, miny, maxx, maxy = nigeria_gdf.total_bounds
-                        bbox_poly = box(minx - 1, miny - 1, maxx + 1, maxy + 1)
-                        clipped = gdf[gdf.intersects(bbox_poly)]
-
-                    clipped = clipped[~clipped.geometry.is_empty]
-                    clipped = clipped[clipped.geometry.is_valid]
-
-                    major_count = 0
-                    for idx, row in clipped.iterrows():
+                        gdf = gpd.read_file(major_shp)
+                        if gdf.crs and gdf.crs.to_epsg() != 4326:
+                            gdf = gdf.to_crs("EPSG:4326")
                         try:
-                            geom_json = mapping(row.geometry)
+                            clipped = gpd.clip(gdf, nigeria_gdf)
                         except Exception:
-                            continue
-                        name = None
-                        for field in ('name', 'NAME', 'Name', 'name_en',
-                                      'river', 'RIVER', 'featurecla'):
-                            if field in row and row[field]:
-                                name = str(row[field])
-                                break
-                        if not name:
-                            name = "Major River"
-                        all_features.append({
-                            "type": "Feature",
-                            "geometry": geom_json,
-                            "properties": {
-                                "name": name,
-                                "waterway": "major_river",
-                                "length_km": round(float(row.geometry.length) * 111.0, 1),
-                                "source": "NaturalEarth",
-                            },
-                        })
-                        major_count += 1
-                    st.success(f"Loaded {major_count} major river segments from {major_shp.name}")
-                except Exception as e:
-                    st.error(f"Major rivers load failed: {e}")
-                    st.code(traceback.format_exc())
+                            clipped = gdf[gdf.intersects(nigeria_gdf.unary_union)]
+                        if len(clipped) == 0:
+                            minx, miny, maxx, maxy = nigeria_gdf.total_bounds
+                            bbox_poly = box(minx - 1, miny - 1, maxx + 1, maxy + 1)
+                            clipped = gdf[gdf.intersects(bbox_poly)]
+                        clipped = clipped[~clipped.geometry.is_empty]
+                        clipped = clipped[clipped.geometry.is_valid]
+
+                        for idx, row in clipped.iterrows():
+                            try:
+                                geom_json = mapping(row.geometry)
+                            except Exception:
+                                continue
+                            name = None
+                            for field in ('name', 'NAME', 'Name', 'name_en',
+                                          'river', 'RIVER'):
+                                if field in row and row[field]:
+                                    name = str(row[field])
+                                    break
+                            if not name:
+                                name = "Major River"
+                            all_features.append({
+                                "type": "Feature",
+                                "geometry": geom_json,
+                                "properties": {
+                                    "name": name,
+                                    "waterway": "river",
+                                    "category": "major_river",
+                                    "length_km": round(float(row.geometry.length) * 111.0, 1),
+                                },
+                            })
+                    except Exception:
+                        pass
 
             if all_features:
                 self.rivers = {
                     "type": "FeatureCollection",
                     "features": all_features,
-                    "metadata": {
-                        "source": "OSM + Natural Earth",
-                        "count": len(all_features),
-                    },
+                    "metadata": {"count": len(all_features)},
                 }
-                st.success(f"TOTAL river features on map: {len(all_features)}")
             else:
-                st.warning("No river features loaded from any source.")
                 self.rivers = None
 
             return True
 
-        except Exception as e:
-            st.error(f"Error loading data: {e}")
-            st.code(traceback.format_exc())
+        except Exception:
             return False
 
     # ------------------------------------------------------------------
@@ -375,7 +321,6 @@ class ProfessionalDataManager:
         return gpd.GeoDataFrame(geometry=[box(*bbox)], crs='EPSG:4326')
 
     def _create_fallback_watersheds(self):
-        st.info("HydroBASINS not available — using Nigeria Hydrological Areas")
         watersheds_data = {
             "HA1": {"name": "Niger North",      "color": "#5DADE2", "bounds": (2.5, 9.5, 9.5, 13.9)},
             "HA2": {"name": "Niger Central",    "color": "#48C9B0", "bounds": (4.0, 7.5, 9.5, 11.0)},
@@ -398,7 +343,6 @@ class ProfessionalDataManager:
                 "properties": {
                     "id": ha_id, "name": info["name"],
                     "color": info["color"],
-                    "source": "NIHSA Hydrological Areas",
                 },
             })
         self.watersheds = {
@@ -409,11 +353,10 @@ class ProfessionalDataManager:
 
 
 # ===========================================================================
-#                         MAIN WEB APP
+#                            WEB APP
 # ===========================================================================
 
 class FloodForecastWebApp:
-    """Main web application."""
 
     PAGES = ["🗺️  Map", "📤 Upload Data", "📊 Forecast & Alerts",
              "📈 Raw Data", "📚 Instructions", "ℹ️  About"]
@@ -449,19 +392,45 @@ class FloodForecastWebApp:
 
         self.data_manager = ProfessionalDataManager(self.r2)
 
-    def _build_map_html(self, system, report, forecast_date) -> Optional[str]:
+    # ------------------------------------------------------------------
+    # Map
+    # ------------------------------------------------------------------
+    def _build_map_html(self) -> Optional[str]:
         try:
             import folium
+            from folium.plugins import Fullscreen, MousePosition
         except ImportError:
-            st.warning("Folium not installed. Run: pip install folium")
             return None
 
         if not self.data_manager.ensure_data_loaded():
-            st.error("Could not load hydrological data")
             return None
 
-        fmap = folium.Map(location=[9.0, 8.0], zoom_start=6,
-                          tiles="CartoDB positron")
+        fmap = folium.Map(
+            location=NIGERIA_CENTER,
+            zoom_start=6,
+            min_zoom=5,
+            max_zoom=14,
+            max_bounds=True,
+            tiles="CartoDB positron",
+            control_scale=True,
+            zoom_control=True,
+        )
+        fmap.fit_bounds(NIGERIA_BOUNDS)
+        # Constrain panning so the user stays on Nigeria.
+        fmap.options['maxBounds'] = [
+            [NIGERIA_BOUNDS[0][0] - 1, NIGERIA_BOUNDS[0][1] - 1],
+            [NIGERIA_BOUNDS[1][0] + 1, NIGERIA_BOUNDS[1][1] + 1],
+        ]
+
+        # Fullscreen + mouse coords
+        Fullscreen(position='topleft',
+                   title='Fullscreen',
+                   title_cancel='Exit fullscreen',
+                   force_separate_button=True).add_to(fmap)
+        MousePosition(position='bottomright',
+                      separator=' | ',
+                      num_digits=3,
+                      prefix='Lat/Lon:').add_to(fmap)
 
         # Boundary
         if self.data_manager.boundary:
@@ -470,13 +439,16 @@ class FloodForecastWebApp:
                     self.data_manager.boundary,
                     name="Nigeria Boundary",
                     style_function=lambda x: {
-                        "color": "#1B2631", "weight": 2, "fillOpacity": 0.05
+                        "color": "#1B2631", "weight": 2,
+                        "fillOpacity": 0.03, "fillColor": "#1B2631",
                     },
+                    control=False,
                 ).add_to(fmap)
-            except Exception as e:
-                st.warning(f"Could not add boundary: {e}")
+            except Exception:
+                pass
 
         # Watersheds
+        watershed_fg = folium.FeatureGroup(name="Watersheds", show=True)
         if self.data_manager.watersheds:
             try:
                 sample = self.data_manager.watersheds.get('features', [{}])[0]
@@ -484,98 +456,99 @@ class FloodForecastWebApp:
                 if 'HYBAS_ID' in props:
                     folium.GeoJson(
                         self.data_manager.watersheds,
-                        name="Watersheds",
                         style_function=lambda x: {
                             'fillColor': '#2C3E50', 'color': '#2C3E50',
-                            'weight': 1.0, 'fillOpacity': 0.12,
+                            'weight': 0.8, 'fillOpacity': 0.10,
                         },
                         tooltip=folium.GeoJsonTooltip(
                             fields=['HYBAS_ID', 'SUB_AREA', 'UP_AREA'],
                             aliases=['ID:', 'Area (km²):', 'Upstream Area (km²):'],
                             localize=True,
                         ),
-                    ).add_to(fmap)
+                    ).add_to(watershed_fg)
                 else:
                     folium.GeoJson(
                         self.data_manager.watersheds,
-                        name="Watersheds",
                         style_function=lambda x: {
                             'fillColor': x['properties'].get('color', '#2C3E50'),
                             'color': '#2C3E50',
-                            'weight': 1.0, 'fillOpacity': 0.18,
+                            'weight': 0.8, 'fillOpacity': 0.18,
                         },
                         tooltip=folium.GeoJsonTooltip(
                             fields=['id', 'name'],
                             aliases=['ID:', 'Name:'],
                             localize=True,
                         ),
-                    ).add_to(fmap)
-            except Exception as e:
-                st.warning(f"Could not add watersheds: {e}")
+                    ).add_to(watershed_fg)
+            except Exception:
+                pass
+        watershed_fg.add_to(fmap)
 
-        # Rivers — draw smaller first so major rivers sit on top.
+        # Rivers split into four toggleable layers.
         if self.data_manager.rivers and self.data_manager.rivers.get('features'):
-            try:
-                def style_river(feature):
-                    props = feature.get('properties', {})
-                    waterway = props.get('waterway', 'stream')
-                    if waterway == 'major_river':
-                        return {"color": "#003366", "weight": 3.0,
-                                "opacity": 0.95, "fillOpacity": 0}
-                    if waterway == 'river':
-                        return {"color": "#1a73e8", "weight": 2.0,
-                                "opacity": 0.9, "fillOpacity": 0}
-                    if waterway == 'stream':
-                        return {"color": "#4dabf7", "weight": 1.1,
-                                "opacity": 0.75, "fillOpacity": 0}
-                    if waterway == 'canal':
-                        return {"color": "#74c0fc", "weight": 1.4,
-                                "opacity": 0.85, "fillOpacity": 0,
-                                "dashArray": "5,5"}
-                    if waterway in ('drain', 'ditch', 'tidal_channel'):
-                        return {"color": "#a5d8ff", "weight": 0.9,
-                                "opacity": 0.7, "fillOpacity": 0}
-                    return {"color": "#3399ff", "weight": 1.3,
-                            "opacity": 0.8, "fillOpacity": 0}
+            features = self.data_manager.rivers['features']
 
+            def collect(predicate):
+                sub = [f for f in features if predicate(f['properties'])]
+                if not sub:
+                    return None
+                return {"type": "FeatureCollection", "features": sub}
+
+            major = collect(lambda p: p.get('category') == 'major_river')
+            rivers = collect(lambda p: p.get('category') == 'river'
+                             and p.get('waterway') == 'river')
+            streams = collect(lambda p: p.get('waterway') == 'stream')
+            canals = collect(lambda p: p.get('waterway') == 'canal')
+            drains = collect(lambda p: p.get('waterway')
+                             in ('drain', 'ditch', 'tidal_channel'))
+
+            # draw order: drains → streams → canals → rivers → major
+            def add_layer(fc, name, show, style):
+                if not fc:
+                    return
+                fg = folium.FeatureGroup(name=name, show=show)
                 folium.GeoJson(
-                    self.data_manager.rivers,
-                    name="Rivers & Streams",
-                    style_function=style_river,
-                    highlight_function=lambda x: {
-                        "weight": 4, "color": "#FF3333",
-                    },
+                    fc,
+                    style_function=lambda x, s=style: s,
                     tooltip=folium.GeoJsonTooltip(
                         fields=['name', 'waterway', 'length_km'],
                         aliases=['Name:', 'Type:', 'Length (km):'],
                         localize=True, sticky=True,
                     ),
-                ).add_to(fmap)
+                ).add_to(fg)
+                fg.add_to(fmap)
 
-                n = len(self.data_manager.rivers.get('features', []))
-                st.caption(f"Showing {n} river/waterway features on map")
-            except Exception as e:
-                st.warning(f"Could not add rivers: {e}")
-        else:
-            st.info("Rivers layer is empty — upload waterway shapefiles to R2 under `geojson/`.")
+            add_layer(drains, "Drains & ditches", False,
+                      {"color": "#a5d8ff", "weight": 0.5,
+                       "opacity": 0.6, "fillOpacity": 0})
+            add_layer(streams, "Streams", True,
+                      {"color": "#74c0fc", "weight": 0.6,
+                       "opacity": 0.75, "fillOpacity": 0})
+            add_layer(canals, "Canals", False,
+                      {"color": "#4dabf7", "weight": 0.7,
+                       "opacity": 0.85, "fillOpacity": 0,
+                       "dashArray": "4,4"})
+            add_layer(rivers, "Rivers", True,
+                      {"color": "#1a73e8", "weight": 1.6,
+                       "opacity": 0.9, "fillOpacity": 0})
+            add_layer(major, "Major rivers", True,
+                      {"color": "#003366", "weight": 3.0,
+                       "opacity": 0.98, "fillOpacity": 0})
 
-        # Legend
+        # Compact legend
         legend_html = """
         {% macro html(this, kwargs) %}
-        <div style="position: fixed; bottom: 20px; left: 20px; z-index: 9999;
-                    background: white; padding: 10px 12px; border-radius: 6px;
-                    box-shadow: 0 1px 4px rgba(0,0,0,0.25);
-                    font: 12px/1.4 Arial,sans-serif;">
-            <b>Legend</b><br>
-            <span style="color:#1B2631">■</span> Nigeria Boundary<br>
-            <span style="color:#2C3E50">▯</span> Watersheds<br>
-            <span style="color:#003366">━</span> Major Rivers<br>
-            <span style="color:#1a73e8">━</span> Rivers<br>
-            <span style="color:#4dabf7">━</span> Streams<br>
-            <span style="color:#74c0fc">╌</span> Canals<br>
-            <span style="color:#C0392B">●</span> RED Alert<br>
-            <span style="color:#F39C12">●</span> AMBER Alert<br>
-            <span style="color:#27AE60">●</span> GREEN Alert
+        <div style="position: fixed; bottom: 18px; left: 12px; z-index: 9999;
+                    background: rgba(255,255,255,0.94); padding: 8px 12px;
+                    border-radius: 6px; box-shadow: 0 1px 6px rgba(0,0,0,0.18);
+                    font: 12px/1.45 -apple-system,Segoe UI,Roboto,Arial,sans-serif;">
+            <div style="font-weight:600; margin-bottom:4px;">Legend</div>
+            <div><span style="display:inline-block;width:14px;height:2px;background:#003366;vertical-align:middle;margin-right:6px;"></span>Major river</div>
+            <div><span style="display:inline-block;width:14px;height:2px;background:#1a73e8;vertical-align:middle;margin-right:6px;"></span>River</div>
+            <div><span style="display:inline-block;width:14px;height:2px;background:#74c0fc;vertical-align:middle;margin-right:6px;"></span>Stream</div>
+            <div><span style="display:inline-block;width:14px;height:2px;background:#4dabf7;border-top:1px dashed #4dabf7;vertical-align:middle;margin-right:6px;"></span>Canal</div>
+            <div style="margin-top:4px;"><span style="display:inline-block;width:10px;height:10px;background:#2C3E5044;border:1px solid #2C3E50;vertical-align:middle;margin-right:6px;"></span>Watershed</div>
+            <div><span style="color:#C0392B">●</span> RED &nbsp;<span style="color:#F39C12">●</span> AMBER &nbsp;<span style="color:#27AE60">●</span> GREEN</div>
         </div>
         {% endmacro %}
         """
@@ -584,88 +557,125 @@ class FloodForecastWebApp:
         legend._template = Template(legend_html)
         fmap.get_root().add_child(legend)
 
-        folium.LayerControl(collapsed=False).add_to(fmap)
+        folium.LayerControl(collapsed=True, position='topright').add_to(fmap)
         return fmap.get_root().render()
 
+    # ------------------------------------------------------------------
+    # Page: Map
+    # ------------------------------------------------------------------
+    def _render_map_page(self):
+        # Strip chrome so the map fills the viewport.
+        st.markdown(
+            """
+            <style>
+            #MainMenu, header, footer { visibility: hidden; }
+            .block-container {
+                padding: 0 !important;
+                max-width: 100% !important;
+            }
+            section[data-testid="stSidebar"] > div {
+                padding-top: 1rem;
+            }
+            .stApp > header { display: none; }
+            .element-container iframe {
+                width: 100% !important;
+                height: calc(100vh - 10px) !important;
+                border: 0 !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.session_state.system is None:
+            with st.spinner("Initializing forecast system..."):
+                from flood_forecast_nigeria import Config, FloodForecastSystem
+                cfg = Config()
+                system = FloodForecastSystem(cfg)
+                system._write_synthetic_gauge_csv()
+                st.session_state.system = system
+
+        html = self._build_map_html()
+        if html:
+            # Large height; the CSS above forces it to viewport height.
+            components.html(html, height=1200, scrolling=False)
+        else:
+            st.error("Could not generate map. Check R2 contents.")
+
+    # ------------------------------------------------------------------
+    # Page: Upload Data (diagnostics)
+    # ------------------------------------------------------------------
+    def _render_upload_page(self):
+        st.title("Upload Data")
+        st.info(
+            "### Expected files under `geojson/` in R2\n"
+            "- `hybas_af_lev06_v1c.zip` — HydroBASINS watersheds\n"
+            "- `nigeria_boundary.geojson` — Nigeria boundary\n"
+            "- `ne_10m_rivers.zip` — Natural Earth major rivers (fallback)\n"
+            "- HOTOSM / OSM waterways shapefile (zip or sidecars) — the "
+            "app matches filenames containing `hotosm`, `waterway`, "
+            "`water_lines`, or `nga_water`.\n\n"
+            "The app mirrors everything under `geojson/`, extracts any "
+            "zips, and discovers shapefiles by keyword on disk."
+        )
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("List R2 contents"):
+                if self.r2:
+                    st.write(self.r2.list_files("geojson/") or "(empty)")
+                else:
+                    st.error("R2 not configured")
+        with c2:
+            if st.button("Show local files"):
+                try:
+                    items = sorted(
+                        str(p.relative_to(self.data_manager.data_dir))
+                        for p in self.data_manager.data_dir.rglob("*")
+                        if p.is_file()
+                    )
+                    st.write(items or "(empty)")
+                except Exception as e:
+                    st.error(str(e))
+        with c3:
+            if st.button("Force re-sync from R2"):
+                st.session_state.data_downloaded_from_r2 = False
+                try:
+                    shutil.rmtree(self.data_manager.data_dir,
+                                  ignore_errors=True)
+                    self.data_manager.data_dir.mkdir(
+                        parents=True, exist_ok=True
+                    )
+                    self.data_manager.watersheds = None
+                    self.data_manager.rivers = None
+                    self.data_manager.boundary = None
+                    st.success("Cache cleared — reload the Map page.")
+                except Exception as e:
+                    st.error(f"Cache clear failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Render
+    # ------------------------------------------------------------------
     def render(self):
-        if st.session_state.page == self.PAGES[0] and st.session_state.r2_connected:
-            st.success("Connected to R2")
-
         with st.sidebar:
+            st.markdown("### Navigation")
             st.session_state.page = st.radio(
-                "Navigation", self.PAGES, key="nav_page_radio"
+                "Page", self.PAGES, key="nav_page_radio",
+                label_visibility="collapsed",
             )
-
-        if st.session_state.page == self.PAGES[0]:
-            st.title("Nigeria Flood Forecast Map")
-
-            if st.session_state.system is None:
-                with st.spinner("Initializing forecast system..."):
-                    from flood_forecast_nigeria import Config, FloodForecastSystem
-                    cfg = Config()
-                    system = FloodForecastSystem(cfg)
-                    system._write_synthetic_gauge_csv()
-                    st.session_state.system = system
-
-            html = self._build_map_html(
-                st.session_state.system,
-                st.session_state.forecast_report,
-                st.session_state.forecast_date,
-            )
-
-            if html:
-                components.html(html, height=700, scrolling=False)
+            st.markdown("---")
+            if st.session_state.r2_connected:
+                st.caption("✅ R2 connected")
             else:
-                st.error("Could not generate map. Check R2 contents.")
+                st.caption("⚠️ R2 not configured")
 
-        elif st.session_state.page == self.PAGES[1]:
-            st.title("Upload Data")
-            st.info(
-                "### Expected files under `geojson/` in R2\n"
-                "- `hybas_af_lev06_v1c.zip` — HydroBASINS watersheds\n"
-                "- `nigeria_boundary.geojson` — Nigeria boundary\n"
-                "- `ne_10m_rivers.zip` — Natural Earth major rivers\n"
-                "- **Any HOTOSM / OSM waterways shapefile** (e.g. "
-                "`hotosm_nga_waterways_lines.zip` or the loose "
-                "`.shp/.shx/.dbf/.prj/.cpg`) — the app matches on the "
-                "`hotosm`/`waterway`/`water_lines`/`nga_water` keywords.\n\n"
-                "The app mirrors **everything** under `geojson/` — so any "
-                "name that contains those keywords is picked up."
-            )
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button("List R2 contents"):
-                    if self.r2:
-                        files = self.r2.list_files("geojson/")
-                        st.write(files or "(empty)")
-                    else:
-                        st.error("R2 not configured")
-            with col2:
-                if st.button("Show local files"):
-                    try:
-                        items = sorted(
-                            str(p.relative_to(self.data_manager.data_dir))
-                            for p in self.data_manager.data_dir.rglob("*")
-                            if p.is_file()
-                        )
-                        st.write(items or "(empty)")
-                    except Exception as e:
-                        st.error(str(e))
-            with col3:
-                if st.button("Force re-sync from R2"):
-                    st.session_state.data_downloaded_from_r2 = False
-                    try:
-                        shutil.rmtree(self.data_manager.data_dir,
-                                      ignore_errors=True)
-                        self.data_manager.data_dir.mkdir(
-                            parents=True, exist_ok=True
-                        )
-                        self.data_manager.watersheds = None
-                        self.data_manager.rivers = None
-                        self.data_manager.boundary = None
-                        st.success("Cache cleared — reload the Map page.")
-                    except Exception as e:
-                        st.error(f"Cache clear failed: {e}")
+        page = st.session_state.page
+        if page == self.PAGES[0]:
+            self._render_map_page()
+        elif page == self.PAGES[1]:
+            self._render_upload_page()
+        else:
+            st.title(page.strip())
+            st.info("Page under construction.")
 
 
 # ===========================================================================
@@ -673,6 +683,12 @@ class FloodForecastWebApp:
 # ===========================================================================
 
 def main():
+    st.set_page_config(
+        page_title="Nigeria Flood Forecast",
+        page_icon="🌊",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     app = FloodForecastWebApp()
     app.render()
 
