@@ -177,7 +177,7 @@ class ProfessionalDataManager:
             # Load rivers
             # ============================================================
             # Check for the extracted river shapefile
-            rivers_shp = self.data_dir / "ne_10m_rivers.shp"
+            rivers_shp = self.data_dir / "ne_10m_rivers_lake_centerlines.shp"
             if not rivers_shp.exists():
                 # Try to find any shapefile with river in name
                 for shp in self.data_dir.glob("**/*.shp"):
@@ -190,28 +190,74 @@ class ProfessionalDataManager:
                 try:
                     rivers = gpd.read_file(rivers_shp)
                     st.write(f"Loaded rivers shapefile with {len(rivers)} features")
+                    st.write(f"Original CRS: {rivers.crs}")
                     
-                    # Get Nigeria boundary
+                    # Get Nigeria boundary and ensure same CRS
                     nigeria = self._get_nigeria_boundary_gdf()
                     
-                    # Filter to Nigeria (with buffer for rivers that cross border)
-                    nigeria_rivers = rivers[rivers.within(nigeria.unary_union.buffer(0.5))]
-                    st.write(f"After filtering to Nigeria: {len(nigeria_rivers)} rivers")
+                    # Reproject rivers to match Nigeria boundary if needed
+                    if rivers.crs != nigeria.crs:
+                        st.info(f"Reprojecting rivers from {rivers.crs} to {nigeria.crs}")
+                        rivers = rivers.to_crs(nigeria.crs)
                     
-                    # Fix geometries
-                    nigeria_rivers['geometry'] = nigeria_rivers['geometry'].buffer(0)
-                    nigeria_rivers = nigeria_rivers[nigeria_rivers.is_valid]
+                    # Get Nigeria boundary geometry
+                    nigeria_geom = nigeria.unary_union
                     
-                    # Convert to GeoJSON
-                    geojson_str = nigeria_rivers.to_json()
-                    self.rivers = json.loads(geojson_str)
-                    self.rivers['metadata'] = {
-                        'source': 'Natural Earth (1:10m)',
-                        'count': len(nigeria_rivers)
-                    }
-                    st.success(f"✅ Loaded {len(nigeria_rivers)} river segments")
+                    # Method 1: Use intersection instead of within (catches rivers that cross border)
+                    st.info("Finding rivers that intersect Nigeria...")
+                    nigeria_rivers = rivers[rivers.intersects(nigeria_geom.buffer(0.5))]
+                    st.write(f"After intersection with Nigeria: {len(nigeria_rivers)} rivers")
+                    
+                    # If still no rivers, try a simpler approach
+                    if len(nigeria_rivers) == 0:
+                        st.warning("No rivers found with intersection, trying bounding box filter...")
+                        # Get bounding box of Nigeria
+                        minx, miny, maxx, maxy = nigeria_geom.bounds
+                        # Filter by bounding box
+                        nigeria_rivers = rivers[
+                            (rivers.geometry.intersects(nigeria_geom)) |
+                            ((rivers.geometry.bounds.minx >= minx) & 
+                             (rivers.geometry.bounds.maxx <= maxx) &
+                             (rivers.geometry.bounds.miny >= miny) & 
+                             (rivers.geometry.bounds.maxy <= maxy))
+                        ]
+                        st.write(f"After bounding box filter: {len(nigeria_rivers)} rivers")
+                    
+                    # If we have rivers, process them
+                    if len(nigeria_rivers) > 0:
+                        # Fix any invalid geometries
+                        nigeria_rivers['geometry'] = nigeria_rivers['geometry'].buffer(0)
+                        nigeria_rivers = nigeria_rivers[nigeria_rivers.is_valid]
+                        
+                        # Limit to major rivers for better performance (optional)
+                        # If there are too many rivers, take the longest ones
+                        if len(nigeria_rivers) > 500:
+                            st.info(f"Found {len(nigeria_rivers)} rivers, limiting to longest 500...")
+                            nigeria_rivers['length'] = nigeria_rivers.geometry.length
+                            nigeria_rivers = nigeria_rivers.nlargest(500, 'length')
+                        
+                        # Convert to GeoJSON
+                        geojson_str = nigeria_rivers.to_json()
+                        self.rivers = json.loads(geojson_str)
+                        self.rivers['metadata'] = {
+                            'source': 'Natural Earth (1:10m)',
+                            'count': len(nigeria_rivers)
+                        }
+                        st.success(f"✅ Loaded {len(nigeria_rivers)} river segments")
+                        
+                        # Preview first river to debug
+                        if len(nigeria_rivers) > 0:
+                            first_river = nigeria_rivers.iloc[0]
+                            st.write(f"Sample river: {first_river.get('name', 'Unnamed')}")
+                            st.write(f"River geometry type: {first_river.geometry.geom_type}")
+                    else:
+                        st.warning("No rivers found in Nigeria region")
+                        self.rivers = None
+                        
                 except Exception as e:
                     st.error(f"River loading failed: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
                     self.rivers = None
             
             # ============================================================
@@ -417,10 +463,23 @@ class FloodForecastWebApp:
         # Add rivers (from Natural Earth)
         if self.data_manager.rivers:
             try:
+                # Count features for debugging
+                num_features = len(self.data_manager.rivers.get('features', []))
+                st.write(f"Rendering {num_features} river features on map")
+                
                 folium.GeoJson(
                     self.data_manager.rivers,
                     name="Rivers",
-                    style_function=lambda x: {"color": "#3498DB", "weight": 1.5, "opacity": 0.7}
+                    style_function=lambda x: {
+                        "color": "#1F618D",  # Darker blue for better visibility
+                        "weight": 2.5,       # Thicker lines
+                        "opacity": 0.9,
+                        "fillOpacity": 0
+                    },
+                    highlight_function=lambda x: {
+                        "weight": 4,
+                        "color": "#E74C3C"
+                    }
                 ).add_to(fmap)
             except Exception as e:
                 st.warning(f"Could not add rivers: {e}")
