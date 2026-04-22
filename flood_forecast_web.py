@@ -1,10 +1,11 @@
-# flood_forecast_web.py - Top navigation using Streamlit tabs
+# flood_forecast_web.py - Top navigation bar, full-page map
 
 from __future__ import annotations
 
 import json
 import re
 import shutil
+import tempfile
 import traceback
 import zipfile
 from pathlib import Path
@@ -331,8 +332,11 @@ class ProfessionalDataManager:
 
 class FloodForecastWebApp:
 
+    PAGES = ["🗺️ Map", "📤 Upload", "📊 Alerts", "📈 Data", "📚 Info", "ℹ️ About"]
+
     def __init__(self):
         defaults = {
+            "page": self.PAGES[0],
             "system": None,
             "forecast_report": None,
             "forecast_date": None,
@@ -525,26 +529,94 @@ class FloodForecastWebApp:
         return fmap.get_root().render()
 
     # ------------------------------------------------------------------
-    # Pages
+    # Page: Map (Full width, no sidebar)
     # ------------------------------------------------------------------
     def _render_map_page(self):
-        # Make map take full width
+        # Hide Streamlit's default sidebar and make map full width
         st.markdown(
             """
             <style>
+            #MainMenu, header, footer { visibility: hidden; display: none; }
+            .stApp header { display: none; }
+            .stApp > div:first-child { display: none; }
+            [data-testid="stSidebar"] { display: none; }
             .block-container {
                 padding: 0 !important;
+                margin: 0 !important;
                 max-width: 100% !important;
+            }
+            section[data-testid="stAppViewBlockContainer"] {
+                padding: 0 !important;
             }
             .element-container iframe {
                 width: 100% !important;
-                height: calc(100vh - 80px) !important;
+                height: calc(100vh - 50px) !important;
                 border: 0 !important;
+            }
+            .top-nav {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                background: #1a1a2e;
+                padding: 10px 20px;
+                z-index: 10000;
+                display: flex;
+                gap: 20px;
+                justify-content: center;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.3);
+                font-family: -apple-system, sans-serif;
+            }
+            .top-nav button {
+                background: transparent;
+                border: none;
+                color: #eee;
+                font-size: 16px;
+                font-weight: 500;
+                padding: 8px 20px;
+                cursor: pointer;
+                border-radius: 8px;
+                transition: all 0.2s;
+            }
+            .top-nav button:hover {
+                background: #16213e;
+                color: white;
+            }
+            .top-nav button.active {
+                background: #0f3460;
+                color: #e94560;
             }
             </style>
             """,
             unsafe_allow_html=True,
         )
+
+        # Create top navigation bar
+        nav_buttons = []
+        for page in self.PAGES:
+            is_active = st.session_state.page == page
+            active_class = 'active' if is_active else ''
+            nav_buttons.append(f'<button class="{active_class}" onclick="parent.postMessage({{type: "streamlit:setComponentValue", value: \'{page}\'}}, \'*\')">{page}</button>')
+        
+        nav_html = f'<div class="top-nav">{"".join(nav_buttons)}</div>'
+        
+        # Add JavaScript for navigation
+        st.markdown(f"""
+        {nav_html}
+        <script>
+        document.querySelectorAll('.top-nav button').forEach(btn => {{
+            btn.addEventListener('click', () => {{
+                const pageName = btn.innerText;
+                // Update active state
+                document.querySelectorAll('.top-nav button').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                // Send to Streamlit
+                const event = new CustomEvent('streamlit:setComponentValue', {{detail: pageName}});
+                window.parent.dispatchEvent(event);
+            }});
+        }});
+        </script>
+        """, unsafe_allow_html=True)
 
         if st.session_state.system is None:
             with st.spinner("Initializing forecast system..."):
@@ -560,6 +632,9 @@ class FloodForecastWebApp:
         else:
             st.error("Could not generate map. Check R2 contents.")
 
+    # ------------------------------------------------------------------
+    # Other pages
+    # ------------------------------------------------------------------
     def _render_upload_page(self):
         st.title("📤 Upload Data")
         st.info(
@@ -659,20 +734,20 @@ class FloodForecastWebApp:
     # Render
     # ------------------------------------------------------------------
     def render(self):
-        # Create tabs at the top for navigation
-        tabs = st.tabs(["🗺️ Map", "📤 Upload", "📊 Alerts", "📈 Data", "📚 Info", "ℹ️ About"])
+        # Handle navigation via session state
+        page = st.session_state.page
         
-        with tabs[0]:
+        if page == self.PAGES[0]:
             self._render_map_page()
-        with tabs[1]:
+        elif page == self.PAGES[1]:
             self._render_upload_page()
-        with tabs[2]:
+        elif page == self.PAGES[2]:
             self._render_alerts_page()
-        with tabs[3]:
+        elif page == self.PAGES[3]:
             self._render_data_page()
-        with tabs[4]:
+        elif page == self.PAGES[4]:
             self._render_info_page()
-        with tabs[5]:
+        elif page == self.PAGES[5]:
             self._render_about_page()
 
 
@@ -685,6 +760,7 @@ def main():
         page_title="Nigeria Flood Forecast",
         page_icon="🌊",
         layout="wide",
+        initial_sidebar_state="collapsed",  # Hide the default sidebar
     )
     app = FloodForecastWebApp()
     app.render()
