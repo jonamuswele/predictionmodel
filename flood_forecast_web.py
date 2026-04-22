@@ -75,22 +75,90 @@ def _try_import_rasterio_features():
 # (lon_min, lat_min, lon_max, lat_max)
 NIGERIA_BBOX: Tuple[float, float, float, float] = (2.65, 4.20, 14.70, 13.90)
 
-# Simplified Nigeria country boundary (~35 vertices). Good enough for a
-# visual clip; not cartographically precise. CC0 approximation.
-NIGERIA_BOUNDARY: List[Tuple[float, float]] = [
-    (3.62, 13.75), (4.30, 13.80), (5.50, 13.85), (6.40, 13.60),
-    (7.40, 13.70), (8.50, 13.20), (10.00, 13.00), (11.30, 13.40),
-    (12.30, 13.10), (13.30, 13.60), (14.00, 13.10), (14.50, 12.90),
-    (14.20, 12.40), (14.60, 12.00), (14.20, 11.50), (14.10, 10.50),
-    (13.80, 10.00), (13.20, 9.60), (12.60, 9.00), (12.80, 8.50),
-    (13.00, 7.80), (12.60, 7.40), (12.20, 7.00), (11.80, 6.60),
-    (11.40, 6.50), (10.60, 7.00), (10.10, 6.90), (9.50, 6.80),
-    (9.00, 6.50), (8.70, 5.60), (8.50, 4.80), (8.30, 4.55),
-    (7.90, 4.30), (7.00, 4.40), (6.20, 4.30), (5.40, 5.50),
-    (4.70, 6.10), (4.00, 6.10), (3.30, 6.30), (2.75, 6.37),
-    (2.70, 6.80), (2.80, 7.80), (2.75, 8.60), (3.00, 9.10),
-    (3.50, 9.90), (3.60, 10.70), (3.70, 11.40), (3.60, 12.30),
-    (3.90, 12.80), (4.00, 13.30), (3.80, 13.70), (3.62, 13.75),
+# Public source for the accurate Nigeria admin-0 polygon (MIT-licensed).
+NIGERIA_BOUNDARY_URL = (
+    "https://raw.githubusercontent.com/johan/world.geo.json/master/"
+    "countries/NGA.geo.json"
+)
+
+# Fallback Nigeria boundary (~100 vertices, rough outline). Used only if the
+# runtime GeoJSON fetch and any cached copy both fail. Coordinates are
+# (lon, lat).
+NIGERIA_BOUNDARY_FALLBACK: List[Tuple[float, float]] = [
+    (3.62, 13.75), (4.10, 13.78), (4.30, 13.81), (4.80, 13.70),
+    (5.50, 13.85), (5.90, 13.80), (6.40, 13.60), (6.90, 13.55),
+    (7.40, 13.70), (7.80, 13.35), (8.50, 13.20), (9.20, 13.00),
+    (10.00, 13.00), (10.60, 13.10), (11.30, 13.40), (11.80, 13.30),
+    (12.30, 13.10), (12.90, 13.30), (13.30, 13.60), (13.70, 13.30),
+    (14.00, 13.10), (14.50, 12.90), (14.45, 12.65), (14.20, 12.40),
+    (14.60, 12.00), (14.40, 11.70), (14.20, 11.50), (14.15, 11.00),
+    (14.10, 10.50), (14.00, 10.25), (13.80, 10.00), (13.50, 9.80),
+    (13.20, 9.60), (12.90, 9.30), (12.60, 9.00), (12.70, 8.75),
+    (12.80, 8.50), (12.95, 8.15), (13.00, 7.80), (12.80, 7.60),
+    (12.60, 7.40), (12.40, 7.20), (12.20, 7.00), (12.00, 6.80),
+    (11.80, 6.60), (11.60, 6.55), (11.40, 6.50), (11.00, 6.75),
+    (10.60, 7.00), (10.35, 6.95), (10.10, 6.90), (9.80, 6.85),
+    (9.50, 6.80), (9.25, 6.65), (9.00, 6.50), (8.85, 6.05),
+    (8.70, 5.60), (8.60, 5.20), (8.50, 4.80), (8.40, 4.65),
+    (8.30, 4.55), (8.10, 4.40), (7.90, 4.30), (7.50, 4.35),
+    (7.00, 4.40), (6.60, 4.35), (6.20, 4.30), (5.80, 4.85),
+    (5.40, 5.50), (5.05, 5.80), (4.70, 6.10), (4.35, 6.10),
+    (4.00, 6.10), (3.65, 6.20), (3.30, 6.30), (2.90, 6.33),
+    (2.75, 6.37), (2.72, 6.55), (2.70, 6.80), (2.75, 7.30),
+    (2.80, 7.80), (2.78, 8.20), (2.75, 8.60), (2.85, 8.85),
+    (3.00, 9.10), (3.25, 9.50), (3.50, 9.90), (3.55, 10.30),
+    (3.60, 10.70), (3.65, 11.05), (3.70, 11.40), (3.65, 11.85),
+    (3.60, 12.30), (3.75, 12.55), (3.90, 12.80), (3.95, 13.05),
+    (4.00, 13.30), (3.90, 13.50), (3.80, 13.70), (3.62, 13.75),
+]
+
+# Nigeria Hydrological Areas (HA1-HA8) — the 8 official water-resource
+# management divisions used by the Nigerian Hydrological Services Agency.
+# Polygons are approximate (each ~15 vertices) and coordinates are (lon, lat).
+# Source: hand-drawn from the published HA map, simplified.
+NIGERIA_HYDRO_AREAS: List[Dict[str, Any]] = [
+    {"id": "HA1", "name": "Niger-North", "color": "#5DADE2", "coords": [
+        (3.62, 13.75), (4.30, 13.80), (5.50, 13.85), (6.40, 13.60),
+        (7.40, 13.70), (7.50, 13.00), (7.60, 12.30), (7.00, 11.90),
+        (6.10, 11.80), (5.20, 11.75), (4.50, 11.70), (3.90, 11.90),
+        (3.65, 12.30), (3.80, 12.80), (4.00, 13.30), (3.62, 13.75)]},
+    {"id": "HA2", "name": "Niger-Central", "color": "#48C9B0", "coords": [
+        (3.90, 11.90), (4.50, 11.70), (5.20, 11.75), (6.10, 11.80),
+        (7.00, 11.90), (7.60, 11.30), (7.80, 10.40), (7.80, 9.50),
+        (6.90, 8.90), (5.80, 8.80), (4.90, 9.20), (4.10, 9.80),
+        (3.70, 10.60), (3.80, 11.30), (3.90, 11.90)]},
+    {"id": "HA3", "name": "Lower Niger", "color": "#F5B041", "coords": [
+        (4.10, 9.80), (4.90, 9.20), (5.80, 8.80), (6.90, 8.90),
+        (7.00, 8.30), (7.10, 7.50), (6.80, 6.80), (6.40, 5.90),
+        (6.30, 5.20), (5.70, 5.30), (4.90, 5.80), (4.30, 6.25),
+        (3.70, 6.40), (3.50, 7.50), (3.90, 8.50), (4.10, 9.80)]},
+    {"id": "HA4", "name": "Upper Benue", "color": "#AF7AC5", "coords": [
+        (10.40, 10.90), (11.20, 10.90), (12.00, 10.70), (12.80, 10.40),
+        (13.70, 10.00), (13.80, 9.30), (13.10, 8.80), (12.50, 8.40),
+        (11.80, 8.30), (11.00, 8.40), (10.40, 8.90), (10.20, 9.60),
+        (10.30, 10.40), (10.40, 10.90)]},
+    {"id": "HA5", "name": "Lower Benue", "color": "#EC7063", "coords": [
+        (6.90, 8.90), (7.80, 9.50), (8.50, 9.50), (9.40, 9.30),
+        (10.20, 9.60), (10.40, 8.90), (11.00, 8.40), (10.80, 7.70),
+        (10.00, 7.40), (9.10, 7.30), (8.20, 7.40), (7.40, 7.60),
+        (7.00, 8.30), (6.90, 8.90)]},
+    {"id": "HA6", "name": "Cross River", "color": "#58D68D", "coords": [
+        (7.40, 7.60), (8.20, 7.40), (9.10, 7.30), (9.50, 6.60),
+        (9.00, 5.80), (8.70, 5.10), (8.30, 4.55), (7.80, 4.45),
+        (7.30, 4.60), (7.15, 5.40), (7.10, 6.20), (7.20, 6.90),
+        (7.40, 7.60)]},
+    {"id": "HA7", "name": "Western Littoral (Ogun-Osun)", "color": "#F4D03F",
+     "coords": [
+        (2.75, 6.37), (3.30, 6.30), (4.30, 6.25), (4.90, 5.80),
+        (5.70, 5.30), (6.30, 5.20), (6.40, 5.90), (6.30, 6.80),
+        (6.10, 7.80), (5.40, 8.40), (4.60, 8.70), (3.90, 8.50),
+        (3.50, 7.50), (3.00, 7.00), (2.70, 6.80), (2.75, 6.37)]},
+    {"id": "HA8", "name": "Lake Chad Basin", "color": "#5D6D7E", "coords": [
+        (10.20, 9.60), (10.80, 9.80), (11.50, 10.00), (12.30, 10.00),
+        (13.00, 10.20), (13.60, 10.60), (14.00, 11.00), (14.20, 11.50),
+        (14.60, 12.00), (14.50, 12.90), (13.80, 13.30), (13.00, 13.30),
+        (12.20, 13.20), (11.40, 13.00), (10.80, 12.80), (10.50, 12.30),
+        (10.20, 11.60), (10.10, 10.80), (10.10, 10.20), (10.20, 9.60)]},
 ]
 
 # Fallback rivers — approximate centerlines for 10 major Nigerian rivers.
@@ -132,32 +200,45 @@ FALLBACK_RIVERS: List[Dict[str, Any]] = [
 ]
 
 
-def _fetch_osm_rivers_nigeria(timeout: float = 40.0
-                              ) -> Optional[List[Dict[str, Any]]]:
+def _fetch_osm_rivers_nigeria(timeout: float = 120.0
+                              ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     """Fetch Nigerian rivers from the OpenStreetMap Overpass API.
 
-    Returns a list of ``{"name": str, "coords": [(lon, lat), ...]}`` dicts,
-    or ``None`` on failure. No API key is required. Rate-limited by
-    Overpass to ~2 requests per second per IP; this function is intended
-    to be called at most once per container boot and its result cached.
+    Returns ``(rivers, status_message)`` where ``rivers`` is a list of
+    ``{"name": str, "coords": [(lon, lat), ...]}`` dicts, or ``None`` on
+    failure. No API key is required.
+
+    Strategy: query by ISO3166-1 area, try four different Overpass mirrors
+    so a single-endpoint outage doesn't kill the feature. Timeout is 120 s
+    because the waterway=river extract for Nigeria is ~3-5 MB.
     """
     try:
         import requests
     except Exception:
-        return None
+        return None, "requests module unavailable"
     query = (
-        '[out:json][timeout:40];'
+        '[out:json][timeout:90];'
         'area["ISO3166-1"="NG"][admin_level=2]->.ng;'
-        '(way["waterway"="river"](area.ng););'
+        '(way["waterway"="river"](area.ng);'
+        ' way["waterway"="canal"](area.ng););'
         'out geom;'
     )
-    for endpoint in ("https://overpass-api.de/api/interpreter",
-                     "https://overpass.kumi.systems/api/interpreter"):
+    endpoints = [
+        "https://overpass-api.de/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.openstreetmap.ru/api/interpreter",
+        "https://overpass.osm.jp/api/interpreter",
+    ]
+    last_err = "no endpoints tried"
+    for endpoint in endpoints:
         try:
-            resp = requests.post(endpoint, data={"data": query}, timeout=timeout)
+            resp = requests.post(endpoint, data={"data": query},
+                                 timeout=timeout,
+                                 headers={"User-Agent": "FloodForecast/1.0"})
             resp.raise_for_status()
             payload = resp.json()
-        except Exception:
+        except Exception as exc:
+            last_err = f"{endpoint}: {exc}"
             continue
         rivers: List[Dict[str, Any]] = []
         for elem in payload.get("elements", []):
@@ -170,8 +251,49 @@ def _fetch_osm_rivers_nigeria(timeout: float = 40.0
             name = (elem.get("tags") or {}).get("name") or "River"
             rivers.append({"name": name, "coords": coords})
         if rivers:
-            return rivers
-    return None
+            return rivers, f"ok ({len(rivers)} ways via {endpoint})"
+    return None, last_err
+
+
+def _fetch_nigeria_boundary(timeout: float = 30.0
+                            ) -> Tuple[Optional[List[Tuple[float, float]]], str]:
+    """Download the accurate Nigeria admin-0 boundary.
+
+    Returns ``(ring, status)`` where ``ring`` is a list of ``(lon, lat)``
+    points for the outer boundary. Falls back to :data:`NIGERIA_BOUNDARY_FALLBACK`
+    on any failure. Data source is a MIT-licensed mirror of Natural Earth.
+    """
+    try:
+        import requests
+    except Exception:
+        return None, "requests module unavailable"
+    try:
+        resp = requests.get(NIGERIA_BOUNDARY_URL, timeout=timeout,
+                            headers={"User-Agent": "FloodForecast/1.0"})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        return None, f"boundary fetch failed: {exc}"
+    try:
+        feat = (data.get("features") or [data])[0]
+        geom = feat.get("geometry") or {}
+        coords = geom.get("coordinates") or []
+        gtype = geom.get("type")
+        if gtype == "Polygon":
+            outer = coords[0] if coords else []
+        elif gtype == "MultiPolygon":
+            # Pick the largest ring (Nigeria's mainland).
+            rings = [(len(poly[0]), poly[0]) for poly in coords if poly]
+            rings.sort(reverse=True)
+            outer = rings[0][1] if rings else []
+        else:
+            return None, f"unexpected geometry: {gtype}"
+        if not outer:
+            return None, "empty boundary ring"
+        ring = [(float(lon), float(lat)) for lon, lat in outer]
+        return ring, f"ok ({len(ring)} vertices)"
+    except Exception as exc:
+        return None, f"boundary parse error: {exc}"
 
 
 # ===========================================================================
@@ -722,10 +844,10 @@ class FloodForecastWebApp:
             except Exception as exc:
                 self._log(f"R2 river cache read failed: {exc}")
         # Live OSM fetch.
-        osm = _fetch_osm_rivers_nigeria()
+        osm, status = _fetch_osm_rivers_nigeria()
         if osm:
             st.session_state.rivers = osm
-            self._log(f"Rivers: fetched {len(osm)} from OpenStreetMap.")
+            self._log(f"Rivers: fetched from OpenStreetMap — {status}")
             if self._r2_enabled():
                 try:
                     self.r2.upload_bytes(
@@ -737,9 +859,49 @@ class FloodForecastWebApp:
                     self._log(f"R2 river cache write failed: {exc}")
             return osm
         # Last resort: hardcoded.
-        self._log("Rivers: using hardcoded fallback (10 major rivers).")
+        self._log(f"Rivers: OSM fetch failed ({status}); "
+                  f"using hardcoded fallback of {len(FALLBACK_RIVERS)} rivers.")
         st.session_state.rivers = FALLBACK_RIVERS
         return FALLBACK_RIVERS
+
+    def _get_nigeria_boundary(self) -> List[Tuple[float, float]]:
+        """Return Nigeria's outer boundary as a list of (lon, lat) vertices.
+
+        Same caching order as :meth:`_get_nigeria_rivers`: session -> R2 ->
+        runtime fetch -> hardcoded fallback.
+        """
+        cached = st.session_state.get("boundary")
+        if cached:
+            return cached
+        if self._r2_enabled():
+            try:
+                wd = self._workdir()
+                local = wd / "cache" / "nigeria_boundary.json"
+                if self.r2.download_file("cache/nigeria_boundary.json", local):
+                    data = json.loads(local.read_text(encoding="utf-8"))
+                    if data:
+                        st.session_state.boundary = data
+                        self._log(f"Boundary: loaded {len(data)} vertices from R2.")
+                        return data
+            except Exception as exc:
+                self._log(f"R2 boundary cache read failed: {exc}")
+        ring, status = _fetch_nigeria_boundary()
+        if ring:
+            st.session_state.boundary = ring
+            self._log(f"Boundary: fetched — {status}")
+            if self._r2_enabled():
+                try:
+                    self.r2.upload_bytes(
+                        json.dumps(ring).encode("utf-8"),
+                        "cache/nigeria_boundary.json",
+                        content_type="application/json",
+                    )
+                except Exception as exc:
+                    self._log(f"R2 boundary cache write failed: {exc}")
+            return ring
+        self._log(f"Boundary: fetch failed ({status}); using hardcoded fallback.")
+        st.session_state.boundary = NIGERIA_BOUNDARY_FALLBACK
+        return NIGERIA_BOUNDARY_FALLBACK
 
     def _river_alert_levels(self, recs: List[Dict[str, Any]]
                             ) -> Dict[str, str]:
@@ -813,43 +975,37 @@ class FloodForecastWebApp:
         )
         fmap.fit_bounds([[lat_min, lon_min], [lat_max, lon_max]])
 
-        # --- Nigeria national boundary (always drawn first) ---
+        # --- Nigeria national boundary (always drawn; accurate fetch) ---
+        boundary = self._get_nigeria_boundary()
         fg_bnd = folium.FeatureGroup(name="Nigeria boundary", show=True)
         folium.PolyLine(
-            [(lat, lon) for lon, lat in NIGERIA_BOUNDARY],
-            color="#1B2631", weight=2.0, opacity=0.7, dash_array="6,4",
+            [(lat, lon) for lon, lat in boundary],
+            color="#1B2631", weight=2.2, opacity=0.85, dash_array="6,4",
+        ).add_to(fg_bnd)
+        # Thin light fill over the country area so the watersheds read against
+        # a neutral ground plane.
+        folium.Polygon(
+            [(lat, lon) for lon, lat in boundary],
+            color="#1B2631", weight=0, fill=True,
+            fill_color="#F8F9F9", fill_opacity=0.35,
         ).add_to(fg_bnd)
         fg_bnd.add_to(fmap)
 
-        # --- Watershed polygons, clipped to Nigeria bbox ---
-        basin_feats = self._basins_to_geojson(system)
-        if basin_feats:
-            fg_b = folium.FeatureGroup(name="Watersheds", show=True)
-            palette = ["#5DADE2", "#48C9B0", "#F5B041", "#AF7AC5",
-                       "#EC7063", "#58D68D", "#F4D03F", "#5D6D7E"]
-            for feat in basin_feats:
-                geom = feat.get("geometry") or {}
-                # Skip any basin whose first coordinate is outside Nigeria.
-                coords = geom.get("coordinates") or []
-                first = None
-                if coords and isinstance(coords[0], list) and coords[0]:
-                    first = coords[0][0] if isinstance(coords[0][0], list) else None
-                if first and len(first) >= 2:
-                    lon, lat = float(first[0]), float(first[1])
-                    if not (lon_min <= lon <= lon_max
-                            and lat_min <= lat <= lat_max):
-                        continue
-                bid = int(feat["properties"]["basin_id"])
-                color = palette[bid % len(palette)]
-                folium.GeoJson(
-                    feat,
-                    style_function=lambda _x, c=color: {
-                        "fillColor": c, "color": "#2C3E50",
-                        "weight": 1.0, "fillOpacity": 0.25,
-                    },
-                    tooltip=f"Watershed {bid}",
-                ).add_to(fg_b)
-            fg_b.add_to(fmap)
+        # --- Watershed polygons: Nigeria's 8 Hydrological Areas (HA1-HA8) ---
+        fg_b = folium.FeatureGroup(name="Watersheds (Hydrological Areas)",
+                                   show=True)
+        for ha in NIGERIA_HYDRO_AREAS:
+            ring = [(lat, lon) for lon, lat in ha["coords"]]
+            folium.Polygon(
+                ring,
+                color="#2C3E50", weight=1.3, opacity=0.9,
+                fill=True, fill_color=ha["color"], fill_opacity=0.22,
+                tooltip=f"{ha['id']} — {ha['name']}",
+                popup=folium.Popup(
+                    f"<b>{ha['id']}: {ha['name']}</b><br>"
+                    f"Nigerian Hydrological Area", max_width=260),
+            ).add_to(fg_b)
+        fg_b.add_to(fmap)
 
         # --- Real Nigerian river network, coloured by alert ---
         rivers = self._get_nigeria_rivers()
