@@ -127,36 +127,36 @@ class ProfessionalDataManager:
     # R2 download
     # ------------------------------------------------------------------
     def _download_all_from_r2(self) -> bool:
-    try:
-        items = [
-            ("geojson/hybas_af_lev06_v1c.zip", self.data_dir / "hybas_af_lev06_v1c.zip", True),
-            ("geojson/ne_10m_rivers.zip",      self.data_dir / "ne_10m_rivers.zip",      True),
-            ("geojson/nigeria_boundary.geojson", self.data_dir / "nigeria_boundary.geojson", False),
-            ("geojson/hotosm_nga_waterways_lines_shp.shp", self.data_dir / "hotosm_nga_waterways_lines_shp.shp", False),
-            ("geojson/hotosm_nga_waterways_lines_shp.shx", self.data_dir / "hotosm_nga_waterways_lines_shp.shx", False),
-            ("geojson/hotosm_nga_waterways_lines_shp.dbf", self.data_dir / "hotosm_nga_waterways_lines_shp.dbf", False),
-            ("geojson/hotosm_nga_waterways_lines_shp.prj", self.data_dir / "hotosm_nga_waterways_lines_shp.prj", False),
-            ("geojson/hotosm_nga_waterways_lines_shp.cpg", self.data_dir / "hotosm_nga_waterways_lines_shp.cpg", False),
-        ]
-        for remote, local, is_zip in items:
-            if not self.r2.exists(remote):
-                st.warning(f"Not in R2: {remote}")
-                continue
-            if local.exists() and local.stat().st_size > 0:
-                st.info(f"Using cached {local.name}")
-            else:
-                st.info(f"Downloading {remote} ...")
-                if not self.r2.download_file(remote, local):
-                    st.warning(f"Download failed: {remote}")
+        try:
+            items = [
+                ("geojson/hybas_af_lev06_v1c.zip", self.data_dir / "hybas_af_lev06_v1c.zip", True),
+                ("geojson/ne_10m_rivers.zip",      self.data_dir / "ne_10m_rivers.zip",      True),
+                ("geojson/nigeria_boundary.geojson", self.data_dir / "nigeria_boundary.geojson", False),
+                ("geojson/hotosm_nga_waterways_lines_shp.shp", self.data_dir / "hotosm_nga_waterways_lines_shp.shp", False),
+                ("geojson/hotosm_nga_waterways_lines_shp.shx", self.data_dir / "hotosm_nga_waterways_lines_shp.shx", False),
+                ("geojson/hotosm_nga_waterways_lines_shp.dbf", self.data_dir / "hotosm_nga_waterways_lines_shp.dbf", False),
+                ("geojson/hotosm_nga_waterways_lines_shp.prj", self.data_dir / "hotosm_nga_waterways_lines_shp.prj", False),
+                ("geojson/hotosm_nga_waterways_lines_shp.cpg", self.data_dir / "hotosm_nga_waterways_lines_shp.cpg", False),
+            ]
+            for remote, local, is_zip in items:
+                if not self.r2.exists(remote):
+                    st.warning(f"Not in R2: {remote}")
                     continue
-                st.success(f"Downloaded {local.name}")
-            if is_zip:
-                self._extract_zip(local)
-        return True
-    except Exception as e:
-        st.error(f"Download failed: {e}")
-        st.code(traceback.format_exc())
-        return False
+                if local.exists() and local.stat().st_size > 0:
+                    st.info(f"Using cached {local.name}")
+                else:
+                    st.info(f"Downloading {remote} ...")
+                    if not self.r2.download_file(remote, local):
+                        st.warning(f"Download failed: {remote}")
+                        continue
+                    st.success(f"Downloaded {local.name}")
+                if is_zip:
+                    self._extract_zip(local)
+            return True
+        except Exception as e:
+            st.error(f"Download failed: {e}")
+            st.code(traceback.format_exc())
+            return False
 
     # ------------------------------------------------------------------
     # Load cached data into memory
