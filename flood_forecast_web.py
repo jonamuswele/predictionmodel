@@ -1,4 +1,4 @@
-# flood_forecast_web.py - Top navigation using Streamlit tabs
+# flood_forecast_web.py - Fixed navigation with tabs above map
 
 from __future__ import annotations
 
@@ -528,18 +528,19 @@ class FloodForecastWebApp:
     # Pages
     # ------------------------------------------------------------------
     def _render_map_page(self):
-        # Make map take full width
+        # Only style the map container, NOT the tabs
         st.markdown(
             """
             <style>
-            .block-container {
-                padding: 0 !important;
-                max-width: 100% !important;
+            /* Make only the map iframe fill space, don't hide tabs */
+            .element-container:has(iframe) {
+                width: 100% !important;
             }
             .element-container iframe {
                 width: 100% !important;
-                height: calc(100vh - 80px) !important;
+                height: calc(100vh - 150px) !important;
                 border: 0 !important;
+                border-radius: 8px !important;
             }
             </style>
             """,
@@ -556,7 +557,7 @@ class FloodForecastWebApp:
 
         html = self._build_map_html()
         if html:
-            components.html(html, height=800, scrolling=False)
+            components.html(html, height=700, scrolling=False)
         else:
             st.error("Could not generate map. Check R2 contents.")
 
@@ -659,20 +660,22 @@ class FloodForecastWebApp:
     # Render
     # ------------------------------------------------------------------
     def render(self):
-        # Create tabs at the top for navigation
-        tabs = st.tabs(["🗺️ Map", "📤 Upload", "📊 Alerts", "📈 Data", "📚 Info", "ℹ️ About"])
+        # Create tabs at the top
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+            ["🗺️ Map", "📤 Upload", "📊 Alerts", "📈 Data", "📚 Info", "ℹ️ About"]
+        )
         
-        with tabs[0]:
+        with tab1:
             self._render_map_page()
-        with tabs[1]:
+        with tab2:
             self._render_upload_page()
-        with tabs[2]:
+        with tab3:
             self._render_alerts_page()
-        with tabs[3]:
+        with tab4:
             self._render_data_page()
-        with tabs[4]:
+        with tab5:
             self._render_info_page()
-        with tabs[5]:
+        with tab6:
             self._render_about_page()
 
 
