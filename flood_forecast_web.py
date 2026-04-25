@@ -26,8 +26,18 @@ except Exception:
 
 try:
     import cloud_storage
-except Exception:
+    _CLOUD_STORAGE_IMPORT_ERROR: Optional[str] = None
+except Exception as _e:
     cloud_storage = None
+    _CLOUD_STORAGE_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    import boto3 as _boto3_probe  # noqa: F401
+    _BOTO3_AVAILABLE = True
+    _BOTO3_IMPORT_ERROR: Optional[str] = None
+except Exception as _e:
+    _BOTO3_AVAILABLE = False
+    _BOTO3_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # ===========================================================================
