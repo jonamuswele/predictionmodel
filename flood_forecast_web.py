@@ -791,7 +791,7 @@ class FloodForecastWebApp:
             return None
 
         fmap = folium.Map(
-            location=NIGERIA_CENTER, zoom_start=6,
+            location=NIGERIA_CENTER, zoom_start=8,
             min_zoom=5, max_zoom=14, max_bounds=True,
             tiles="CartoDB positron",
             control_scale=True, zoom_control=True,
